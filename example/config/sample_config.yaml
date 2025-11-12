@@ -1,0 +1,146 @@
+# 샘플 프로젝트 설정 파일
+# 주의: 본 파일은 샘플/데모 목적입니다
+
+# 데이터 설정
+data:
+  symbol: "NVDA"  # NVIDIA 주식 (기본값)
+  start_date: "2019-01-01"
+  end_date: "2024-12-31"
+  data_source: "yahoo"  # yfinance 사용
+  output_dir: "data"
+  output_file: "nvda_data.csv"  # {symbol.lower()}_data.csv 형식
+  min_data_days: 730  # 최소 데이터 기간 (2년)
+
+# 모델 설정
+models:
+  xgboost:
+    n_estimators: 100
+    max_depth: 6
+    learning_rate: 0.05
+    min_child_weight: 1
+    gamma: 0.1
+    reg_alpha: 0.1
+    reg_lambda: 1.0
+    subsample: 0.8
+    colsample_bytree: 0.8
+    num_class: 3  # BUY, SELL, HOLD
+    random_state: 42
+    eval_metric: "mlogloss"
+  
+  lstm:
+    sequence_length: 20
+    lstm_units: 32
+    num_layers: 2
+    dropout_rate: 0.2
+    epochs: 30
+    learning_rate: 0.001
+    optimizer: "Adam"
+    input_size: 5  # close, volume, rsi, macd, bb_position
+    fc_hidden_size: 16
+    output_size: 5  # target_price, stop_loss, time_horizon, confidence, volatility
+    device: "cpu"  # cpu or cuda
+    # 가격 예측 기본값
+    default_target_ratio: 1.02  # 현재가격 * 1.02
+    default_stop_loss_ratio: 0.98  # 현재가격 * 0.98
+    unrealistic_range_min: 0.5
+    unrealistic_range_max: 2.0
+  
+  rl:
+    algorithm: "PPO"
+    learning_rate: 3e-4
+    total_timesteps: 100000
+    gamma: 0.99
+    n_steps: 256
+    batch_size: 128
+    n_epochs: 10
+    ent_coef: 0.05
+    vf_coef: 0.5
+    max_grad_norm: 0.5
+    clip_range: 0.2
+    initial_balance: 100000
+    position_size: 0.3  # 고정 포지션 크기
+    observation_space_size: 12
+    # 보상 함수 파라미터
+    reward_scale: 200
+    opportunity_cost_penalty: 50
+    avoidance_bonus: 30
+    correct_direction_bonus: 100
+    wrong_direction_penalty: 50
+    action_bonus: 0.5
+    transaction_cost: 0.05
+    price_normalization: 200  # 가격 정규화 기준
+
+# 학습/테스트 설정
+training:
+  train_test_split: 0.8
+  validation_split: 0.8  # 학습 데이터의 80%를 다시 학습용으로 사용
+  enable_gpu: false
+  verbose: true
+
+# 레이블 생성 설정
+labeling:
+  buy_percentile: 70  # 상위 30% = BUY
+  sell_percentile: 30  # 하위 30% = SELL
+  default_target_ratio: 1.02  # 2% 상승 목표
+  default_stop_loss_ratio: 0.98  # 2% 손절
+  default_time_horizon: 5  # 5일
+  default_confidence: 0.7
+
+# 백테스트 설정
+backtest:
+  initial_balance: 100000
+  transaction_cost_rate: 0.001  # 0.1%
+  sequence_start_offset: 20  # LSTM 시퀀스 길이
+
+# 앙상블 설정
+ensemble:
+  buy_threshold: 0.35
+  sell_threshold: 0.35
+  strong_signal_threshold: 0.4
+  base_position_size_multiplier: 0.4
+  max_position_size: 0.4
+  rl_match_position_multiplier: 1.2
+  max_position_size_rl_match: 0.5
+  # 신뢰도 가중치
+  direction_weight: 0.3
+  price_weight: 0.4
+  rl_weight: 0.3
+  default_current_price: 150.0
+
+# 피처 엔지니어링 설정
+feature_engineering:
+  # 이동평균
+  ma_5: 5
+  ma_20: 20
+  ma_60: 60
+  # EMA
+  ema_12: 12
+  ema_26: 26
+  # MACD
+  macd_signal_window: 9
+  # RSI
+  rsi_window: 14
+  # Bollinger Bands
+  bb_window: 20
+  bb_std: 2
+  # Z-Score
+  z_score_window: 20
+  # 거래량
+  volume_ma_window: 20
+  # 변동성
+  volatility_window: 20
+  # LSTM 시퀀스
+  lstm_sequence_features: ["close", "volume", "rsi", "macd", "bb_position"]
+  # 상태 정보
+  default_initial_balance: 100000.0
+  default_initial_position: 0.0
+  default_volatility: 0.01
+
+# 시각화 설정
+visualization:
+  dpi: 150
+  portfolio_cover_dpi: 100
+  portfolio_cover_size: [4.8, 4.8]  # 인치
+  lstm_sample_size: 50
+  feature_importance_top_n: 15
+
