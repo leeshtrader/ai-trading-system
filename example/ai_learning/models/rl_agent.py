@@ -19,13 +19,23 @@ matplotlib.use('Agg')  # GUI 없이 사용
 
 # stable-baselines3 import 시도
 STABLE_BASELINES3_AVAILABLE = False
+RL_ALGORITHMS = {}
 try:
-    from stable_baselines3 import PPO
+    from stable_baselines3 import PPO, A2C, DQN, SAC, TD3, DDPG
     from stable_baselines3.common.env_util import make_vec_env
+    # 지원하는 알고리즘 딕셔너리
+    RL_ALGORITHMS = {
+        'PPO': PPO,
+        'A2C': A2C,
+        'DQN': DQN,
+        'SAC': SAC,
+        'TD3': TD3,
+        'DDPG': DDPG
+    }
     STABLE_BASELINES3_AVAILABLE = True
 except ImportError:
     # 더미 클래스 (에러 방지)
-    class PPO:
+    class DummyAlgorithm:
         def __init__(self, *args, **kwargs):
             pass
         def learn(self, *args, **kwargs):
@@ -37,6 +47,9 @@ except ImportError:
         @staticmethod
         def load(*args, **kwargs):
             return None
+    
+    for alg_name in ['PPO', 'A2C', 'DQN', 'SAC', 'TD3', 'DDPG']:
+        RL_ALGORITHMS[alg_name] = DummyAlgorithm
 
 # gym/gymnasium import 시도
 GYM_AVAILABLE = False
@@ -77,7 +90,9 @@ if GYM_AVAILABLE and STABLE_BASELINES3_AVAILABLE:
         강화학습을 위한 환경 정의
         """
         
-        def __init__(self, price_data: np.ndarray, initial_balance: float = 100000, config: Dict = None):
+        def __init__(self, price_data: np.ndarray, initial_balance: float = 100000, 
+                     config: Dict = None, xgb_model=None, lstm_model=None, 
+                     features_data=None, sequences_data=None):
             super(SimpleTradingEnv, self).__init__()
             
             if config is None:
@@ -87,15 +102,28 @@ if GYM_AVAILABLE and STABLE_BASELINES3_AVAILABLE:
             self.initial_balance = initial_balance
             self.balance = initial_balance
             self.position = 0.0  # -1.0 ~ 1.0
+            self.entry_price = 0.0  # 진입가 초기화
             self.current_step = 0
             self.config = config
             
-            # Action: Discrete action space (0=HOLD, 1=BUY, 2=SELL)
-            self.action_space = spaces.Discrete(3)  # 0: HOLD, 1: BUY, 2: SELL
-            self.position_size = config.get('position_size', 0.3)
+            # XGBoost/LSTM 모델 저장 (학습 시 observation에 포함)
+            self.xgb_model = xgb_model
+            self.lstm_model = lstm_model
+            self.features_data = features_data  # XGBoost용 피처 데이터
+            self.sequences_data = sequences_data  # LSTM용 시퀀스 데이터
             
-            # Observation: [position, balance_ratio, price_normalized, price_change, ...]
-            observation_space_size = config.get('observation_space_size', 12)
+            # Action Space: Box(1) - [position_size]만 사용
+            # 주식은 숏 포지션이 없으므로 position_size만으로 충분
+            # position_size: 0.0 (청산) ~ 1.0 (최대 롱)
+            # position_size가 증가하면 매수, 감소하면 매도
+            self.action_space = spaces.Box(
+                low=np.array([0.0], dtype=np.float32),
+                high=np.array([1.0], dtype=np.float32),
+                dtype=np.float32
+            )
+            
+            # Observation: [position, balance_ratio, price_normalized, price_change, ..., xgb_prob, lstm_target, ...]
+            observation_space_size = config.get('observation_space_size', 14)  # XGBoost/LSTM 정보 포함
             self.observation_space = spaces.Box(
                 low=-np.inf,
                 high=np.inf,
@@ -107,6 +135,7 @@ if GYM_AVAILABLE and STABLE_BASELINES3_AVAILABLE:
             # gymnasium v0.28+ API 호환성
             self.balance = self.initial_balance
             self.position = 0.0
+            self.entry_price = 0.0  # 진입가 초기화
             self.current_step = 0
             observation = self._get_observation()
             info = {}
@@ -114,8 +143,31 @@ if GYM_AVAILABLE and STABLE_BASELINES3_AVAILABLE:
         
         def step(self, action):
             # gymnasium v0.28+ API: (observation, reward, terminated, truncated, info)
-            action_type = int(action)  # Discrete action: 0=HOLD, 1=BUY, 2=SELL
-            position_size = self.position_size  # 고정 포지션 크기
+            # Action: [position_size] - 주식은 position_size만 사용
+            # position_size: 0.0 (청산) ~ 1.0 (최대 롱)
+            # action을 1차원 배열로 변환하고 스칼라로 안전하게 추출
+            action = np.asarray(action).flatten()
+            action = np.clip(action, 0.0, 1.0)  # 안전장치
+            
+            # position_size 추출 및 이산화 (10% 단위로만 선택 가능)
+            if len(action) > 0:
+                position_size_val = action[0]
+                if hasattr(position_size_val, '__len__') and not isinstance(position_size_val, str):
+                    position_size = float(np.asarray(position_size_val).flatten()[0])
+                else:
+                    position_size = float(position_size_val)
+            else:
+                position_size = 0.0
+            
+            position_size = float(np.clip(position_size, 0.0, 1.0))
+            
+            # 액션 이산화: 10% 단위로만 선택 가능 (0.0, 0.1, 0.2, ..., 1.0)
+            # 이렇게 하면 미세한 조절(10% 미만)을 아예 할 수 없게 됨
+            min_meaningful_change = self.config.get('min_meaningful_position_change', 0.10)
+            position_size = round(position_size / min_meaningful_change) * min_meaningful_change
+            position_size = float(np.clip(position_size, 0.0, 1.0))
+            
+            # action_type 제거: position_size만 사용
             
             if self.current_step >= len(self.price_data) - 1:
                 observation = self._get_observation()
@@ -125,19 +177,55 @@ if GYM_AVAILABLE and STABLE_BASELINES3_AVAILABLE:
                 info = {}
                 return observation, reward, terminated, truncated, info
             
-            current_price = self.price_data[self.current_step]
-            next_price = self.price_data[self.current_step + 1]
+            # 가격을 스칼라로 안전하게 변환
+            current_price_val = self.price_data[self.current_step]
+            if hasattr(current_price_val, '__len__') and not isinstance(current_price_val, str):
+                current_price = float(np.asarray(current_price_val).flatten()[0])
+            else:
+                current_price = float(current_price_val)
             
-            # 행동 실행
-            if action_type == 1:  # BUY
-                new_position = min(self.position + position_size, 1.0)
-            elif action_type == 2:  # SELL
-                new_position = max(self.position - position_size, -1.0)
-            else:  # HOLD
-                new_position = self.position
+            next_price_val = self.price_data[self.current_step + 1]
+            if hasattr(next_price_val, '__len__') and not isinstance(next_price_val, str):
+                next_price = float(np.asarray(next_price_val).flatten()[0])
+            else:
+                next_price = float(next_price_val)
+            
+            # position을 스칼라로 안전하게 변환 (먼저 정의)
+            position_val = self.position
+            if hasattr(position_val, '__len__') and not isinstance(position_val, str):
+                position_scalar = float(np.asarray(position_val).flatten()[0])
+            else:
+                position_scalar = float(position_val)
+            
+            # 행동 실행: position_size를 직접 목표 포지션으로 설정
+            # position_size가 증가하면 매수, 감소하면 매도
+            new_position_val = position_size
+            
+            # 포지션이 0에서 양수로 변경되면 진입가 설정
+            if position_scalar == 0.0 and new_position_val > 0.0:
+                self.entry_price = current_price
+            
+            # 포지션이 0이 되면 진입가 초기화
+            if position_scalar != 0.0 and new_position_val == 0.0:
+                self.entry_price = 0.0
+            
+            # new_position을 스칼라로 보장
+            if hasattr(new_position_val, '__len__') and not isinstance(new_position_val, str):
+                new_position = float(np.asarray(new_position_val).flatten()[0])
+            else:
+                new_position = float(new_position_val)
+            
+            # 추가 매수 시 평균 진입가 업데이트 (분할매수 지원)
+            # 포지션이 증가하고 기존 포지션이 있을 때 평균 진입가 계산
+            if position_scalar > 0.0 and new_position > position_scalar:
+                # 추가 매수량 계산
+                additional_size = new_position - position_scalar
+                # 평균 진입가 = (기존 포지션 가치 + 추가 매수 가치) / 총 포지션
+                total_value = self.entry_price * position_scalar + current_price * additional_size
+                self.entry_price = total_value / new_position if new_position > 0.0 else current_price
             
             # 수익률 계산
-            price_change = (next_price - current_price) / current_price
+            price_change = (next_price - current_price) / current_price if current_price > 0 else 0.0
             
             # 설정 파일에서 보상 파라미터 읽기
             reward_scale = self.config.get('reward_scale', 200)
@@ -146,40 +234,233 @@ if GYM_AVAILABLE and STABLE_BASELINES3_AVAILABLE:
             correct_direction_bonus = self.config.get('correct_direction_bonus', 100)
             wrong_direction_penalty = self.config.get('wrong_direction_penalty', 50)
             action_bonus = self.config.get('action_bonus', 0.5)
-            transaction_cost = self.config.get('transaction_cost', 0.05)
             
-            # 기본 보상: 포지션에 따른 수익률
-            if self.position != 0.0:
-                reward = self.position * price_change * reward_scale
+            # 거래 비용 계산 (백테스트와 동일한 방식)
+            # 백테스트: transaction_cost = abs(position) * balance * transaction_cost_rate
+            # RL 환경: transaction_cost = abs(position_change) * balance * transaction_cost_rate
+            # 백테스트 설정에서 transaction_cost_rate 읽기
+            backtest_config = self.config.get('backtest', {})
+            transaction_cost_rate = backtest_config.get('transaction_cost_rate', 0.001)  # 0.1%
+            
+            # 기본 보상: 포지션 크기를 고려한 수익률 기반 보상 (논리적 일관성 개선)
+            # 실제 수익 = 가격 변화율 × 포지션 크기
+            # 포지션 크기가 클수록 실제 수익이 커지므로, 보상도 포지션 크기에 비례해야 함
+            if position_scalar != 0.0:
+                # 실제 수익률 = 가격 변화율 × 포지션 크기
+                actual_return = price_change * position_scalar
+                reward = float(actual_return * reward_scale)
+                
+                # 리스크 조정: 변동성 페널티는 포지션 크기의 제곱에 비례 (분산의 성질)
+                # 포지션 크기가 2배가 되면 리스크는 4배가 됨 (분산 = 표준편차^2)
+                risk_penalty_scale = self.config.get('position_risk_penalty_scale', 80)
+                # 변동성 추정 (최근 가격 변화의 절대값)
+                volatility_estimate = abs(price_change)
+                # 포지션 크기의 제곱에 비례하는 리스크 페널티
+                position_risk_penalty = (position_scalar ** 2) * volatility_estimate * risk_penalty_scale
+                reward = float(reward - position_risk_penalty)
             else:
-                reward = 0.0
-            
-            # HOLD에 대한 기회비용 페널티 (가격이 오를 때 HOLD하면 손실)
-            if action_type == 0:  # HOLD
-                if price_change > 0.01:  # 가격이 1% 이상 오르면
-                    reward -= abs(price_change) * opportunity_cost_penalty
-                elif price_change < -0.01:  # 가격이 1% 이상 떨어지면
-                    reward += abs(price_change) * avoidance_bonus
-            
-            # BUY/SELL 행동에 대한 보너스 (탐험 장려)
-            if action_type == 1:  # BUY
-                if price_change > 0:
-                    reward += abs(price_change) * correct_direction_bonus
-                else:
-                    reward += price_change * wrong_direction_penalty
-                reward += action_bonus
-            elif action_type == 2:  # SELL
+                # 포지션 0 유지에 대한 보상: 기회비용 회피 보너스
+                # 가격이 하락하면 보너스 (손실 회피), 상승하면 작은 페널티 (기회비용)
+                small_opportunity_cost_penalty = self.config.get('opportunity_cost_penalty', 50) * 0.1  # 기회비용의 10%
                 if price_change < 0:
-                    reward += abs(price_change) * correct_direction_bonus
+                    # 손실 회피 보너스: 가격 하락 시 포지션 0 유지는 올바른 결정
+                    reward = float(abs(price_change) * avoidance_bonus)
                 else:
-                    reward += abs(price_change) * wrong_direction_penalty
-                reward += action_bonus
+                    # 작은 기회비용 페널티: 가격 상승 시 포지션 0 유지는 기회비용
+                    reward = float(-price_change * small_opportunity_cost_penalty)
             
-            # 거래 비용
-            if action_type != 0:
-                reward -= transaction_cost
+            # 포지션 변화량 계산 (이산화되어 있으므로 0.0, 0.1, 0.2, ... 같은 이산값만 나옴)
+            position_change = abs(new_position - position_scalar)
             
-            self.position = new_position
+            # 거래 비용 계산 (백테스트와 동일한 방식: 포지션 변경량 × 자본금 × 수수료율)
+            # 포지션이 실제로 변경되었을 때만 거래 비용 발생
+            if position_change > 0.0:  # 이산화되어 있으므로 정확한 0.0 비교 가능
+                # 백테스트와 동일: transaction_cost = abs(position_change) * balance * transaction_cost_rate
+                # position_change는 비중(0.0~1.0), balance는 실제 자본금
+                transaction_cost = position_change * self.balance * transaction_cost_rate
+                reward = float(reward - transaction_cost)
+            
+            # 포지션 유지/전체 청산에 대한 기회비용 페널티
+            # 포지션이 0이 되면 (유지 또는 전체 청산) 다음 스텝에서 가격 상승 시 기회비용 발생
+            if new_position == 0.0:  # 포지션이 0이 됨 (유지 또는 전체 청산)
+                if price_change > 0.01:  # 가격이 1% 이상 오르면
+                    # 전체 청산 시에는 청산한 포지션 크기에 비례하여 페널티 적용
+                    # 포지션 유지(0→0)는 작은 페널티, 전체 청산(1.0→0.0)은 큰 페널티
+                    penalty_multiplier = 1.0 if position_scalar == 0.0 else position_scalar  # 전체 청산 시 포지션 크기만큼 페널티
+                    reward = float(reward - abs(price_change) * opportunity_cost_penalty * penalty_multiplier)
+                elif price_change < -0.01:  # 가격이 1% 이상 떨어지면
+                    # 손실 회피 보너스 (포지션 유지 또는 전체 청산으로 손실 회피)
+                    bonus_multiplier = 1.0 if position_scalar == 0.0 else position_scalar  # 전체 청산 시 포지션 크기만큼 보너스
+                    reward = float(reward + abs(price_change) * avoidance_bonus * bonus_multiplier)
+            
+            # 포지션 증가/감소에 대한 방향성 보상
+            if new_position > position_scalar:  # 포지션 증가
+                if price_change > 0:
+                    reward = float(reward + abs(price_change) * correct_direction_bonus * position_change)
+                else:
+                    reward = float(reward + price_change * wrong_direction_penalty * position_change)
+            elif new_position < position_scalar:  # 포지션 감소
+                if price_change < 0:
+                    reward = float(reward + abs(price_change) * correct_direction_bonus * position_change)
+                else:
+                    reward = float(reward + abs(price_change) * wrong_direction_penalty * position_change)
+            
+            # 포지션 조절 보상 (수익이 있을 때 포지션을 줄이면 보상, 손실이 있을 때 포지션을 늘리면 페널티)
+            # 주의: entry_price는 위에서 이미 평균 진입가로 업데이트되었으므로, 평가손익은 정확하게 계산됨
+            if position_scalar != 0.0 and new_position != position_scalar:
+                # 업데이트된 평균 진입가 기준으로 평가손익 계산
+                unrealized_pnl_ratio = (current_price - self.entry_price) / self.entry_price if self.entry_price > 0 else 0.0
+                position_change_abs = abs(new_position - position_scalar)  # 절대 변화량
+                
+                # 수익이 있을 때 포지션을 줄이면 보상 (익실현) - 변화량이 클수록 보상
+                profit_taking_scale = self.config.get('profit_taking_bonus_scale', 200)  # reward_scale과 동일
+                loss_expansion_scale = self.config.get('loss_expansion_penalty_scale', 100)  # reward_scale의 절반
+                if unrealized_pnl_ratio > 0.01 and new_position < position_scalar:  # 1% 이상 수익 + 포지션 감소
+                    profit_taking_bonus = unrealized_pnl_ratio * position_change_abs * profit_taking_scale
+                    reward = float(reward + profit_taking_bonus)
+                # 손실이 있을 때 포지션을 늘리면 페널티 (손실 확대) - 단, 강한 상승 예상 시 보너스/페널티 감소
+                elif unrealized_pnl_ratio < -0.01 and new_position > position_scalar:  # 1% 이상 손실 + 포지션 증가
+                    # XGBoost/LSTM 신호 확인 (강한 상승 예상 여부)
+                    strong_buy_signal = False
+                    buy_prob = 0.5
+                    target_price_ratio = 1.0
+                    
+                    # XGBoost 신호 확인
+                    if self.xgb_model is not None and self.features_data is not None and self.current_step < len(self.features_data):
+                        try:
+                            features = self.features_data.iloc[self.current_step].values.reshape(1, -1)
+                            direction_pred = self.xgb_model.predict_proba(features)[0]
+                            direction_pred = np.asarray(direction_pred).flatten()
+                            if len(direction_pred) >= 3:
+                                buy_prob_val = direction_pred[1]
+                                if hasattr(buy_prob_val, '__len__') and not isinstance(buy_prob_val, str):
+                                    buy_prob = float(np.asarray(buy_prob_val).flatten()[0])
+                                else:
+                                    buy_prob = float(buy_prob_val)
+                        except:
+                            pass
+                    
+                    # LSTM 목표가 확인
+                    if self.lstm_model is not None and self.sequences_data is not None and self.current_step < len(self.sequences_data):
+                        try:
+                            sequence = self.sequences_data[self.current_step].reshape(1, -1, 5)
+                            price_pred = self.lstm_model.predict(sequence, current_price=current_price)
+                            target_price_val = price_pred.get('target_price', current_price * 1.02)
+                            target_price = float(np.asarray(target_price_val).flatten()[0]) if hasattr(target_price_val, '__len__') else float(target_price_val)
+                            target_price_ratio = target_price / current_price if current_price > 0 else 1.02
+                        except:
+                            pass
+                    
+                    # 강한 상승 예상 판단: XGBoost BUY 확률이 높거나 LSTM 목표가가 현재가 대비 충분히 높을 때
+                    # BUY 확률 > 0.6 또는 목표가가 현재가 대비 3% 이상 높으면 강한 상승 예상
+                    strong_buy_signal = (buy_prob > 0.6) or (target_price_ratio > 1.03)
+                    
+                    # 손실 확대 페널티 계산
+                    base_penalty = abs(unrealized_pnl_ratio) * position_change_abs * loss_expansion_scale
+                    
+                    if strong_buy_signal:
+                        # 강한 상승 예상 시: 페널티 감소 또는 보너스 부여
+                        # XGBoost 신호 강도와 LSTM 목표가 비율에 따라 조정
+                        signal_strength = min(1.0, (buy_prob - 0.5) * 2.0)  # 0.5~1.0 → 0.0~1.0
+                        target_strength = min(1.0, max(0.0, (target_price_ratio - 1.0) * 10.0))  # 1.0~1.1 → 0.0~1.0
+                        combined_strength = (signal_strength + target_strength) / 2.0
+                        
+                        # 페널티 감소 또는 보너스: 강한 신호일수록 페널티 감소, 매우 강하면 보너스
+                        if combined_strength > 0.7:  # 매우 강한 신호
+                            # 보너스 부여 (분할매수 장려)
+                            averaging_down_bonus = base_penalty * 0.3 * combined_strength  # 페널티의 30%를 보너스로
+                            reward = float(reward + averaging_down_bonus)
+                        else:  # 강한 신호 (보통)
+                            # 페널티 감소
+                            penalty_reduction = base_penalty * combined_strength * 0.5  # 페널티의 최대 50% 감소
+                            reward = float(reward - (base_penalty - penalty_reduction))
+                    else:
+                        # 약한 신호 또는 하락 예상: 기존 페널티 적용 (무작정 분할매수 방지)
+                        reward = float(reward - base_penalty)
+            
+            # 최종 reward를 스칼라로 보장
+            if hasattr(reward, '__len__') and not isinstance(reward, str):
+                reward = float(np.asarray(reward).flatten()[0])
+            else:
+                reward = float(reward)
+            
+            # XGBoost/LSTM 신호 일치 보너스 (보상 함수 개선)
+            # RL의 결정이 XGBoost/LSTM 신호와 일치하면 추가 보상
+            signal_match_bonus = self.config.get('signal_match_bonus', 10.0)
+            if self.xgb_model is not None and self.features_data is not None and self.current_step < len(self.features_data):
+                try:
+                    features = self.features_data.iloc[self.current_step].values.reshape(1, -1)
+                    direction_pred = self.xgb_model.predict_proba(features)[0]
+                    direction_pred = np.asarray(direction_pred).flatten()  # 1차원 배열로 변환
+                    if len(direction_pred) >= 3:
+                        # 배열 요소를 스칼라로 안전하게 변환
+                        buy_prob_val = direction_pred[1]
+                        if hasattr(buy_prob_val, '__len__') and not isinstance(buy_prob_val, str):
+                            buy_prob = float(np.asarray(buy_prob_val).flatten()[0])
+                        else:
+                            buy_prob = float(buy_prob_val)
+                        
+                        sell_prob_val = direction_pred[2]
+                        if hasattr(sell_prob_val, '__len__') and not isinstance(sell_prob_val, str):
+                            sell_prob = float(np.asarray(sell_prob_val).flatten()[0])
+                        else:
+                            sell_prob = float(sell_prob_val)
+                        
+                        # RL의 결정과 XGBoost 신호 일치 확인 (position_size 기반)
+                        # 포지션 증가 + BUY 신호 강함 → 보상
+                        if new_position > position_scalar and buy_prob > 0.5:
+                            reward = float(reward + signal_match_bonus * buy_prob * position_change)
+                        # 포지션 감소 + SELL 신호 강함 → 보상
+                        elif new_position < position_scalar and sell_prob > 0.5:
+                            reward = float(reward + signal_match_bonus * sell_prob * position_change)
+                        # 포지션 유지 + 신호 약함 → 보상
+                        elif new_position == position_scalar and (buy_prob < 0.4 and sell_prob < 0.4):
+                            reward = float(reward + signal_match_bonus * 0.5)
+                except:
+                    pass
+            
+            # LSTM 목표가/손절가 기반 비중 조절 보상
+            # 주가가 목표가보다 높으면 비중을 줄이면 보상, 손절가보다 낮으면 비중을 늘리면 보상
+            lstm_position_bonus = self.config.get('lstm_position_bonus', 5.0)
+            if self.lstm_model is not None and self.sequences_data is not None and self.current_step < len(self.sequences_data):
+                try:
+                    sequence = self.sequences_data[self.current_step].reshape(1, -1, 5)
+                    price_pred = self.lstm_model.predict(sequence, current_price=current_price)
+                    target_price_val = price_pred.get('target_price', current_price * 1.02)
+                    stop_loss_val = price_pred.get('stop_loss', current_price * 0.98)
+                    target_price = float(np.asarray(target_price_val).flatten()[0]) if hasattr(target_price_val, '__len__') else float(target_price_val)
+                    stop_loss = float(np.asarray(stop_loss_val).flatten()[0]) if hasattr(stop_loss_val, '__len__') else float(stop_loss_val)
+                    
+                    # LSTM 보상 스케일 (설정 파일에서 읽기)
+                    lstm_bonus_scale = self.config.get('lstm_position_bonus_scale', 10.0)
+                    lstm_penalty_scale = self.config.get('lstm_position_penalty_scale', 5.0)
+                    
+                    # 현재 가격이 목표가보다 높은 경우 (고평가)
+                    if current_price > target_price:
+                        # 비중을 줄이면 보상 (변화량이 클수록 보상)
+                        if new_position < position_scalar:  # 포지션 감소
+                            reward = float(reward + lstm_position_bonus * position_change * lstm_bonus_scale)
+                        # 비중을 늘리면 페널티
+                        elif new_position > position_scalar:  # 포지션 증가
+                            reward = float(reward - lstm_position_bonus * position_change * lstm_penalty_scale)
+                    
+                    # 현재 가격이 손절가보다 낮은 경우 (저평가)
+                    elif current_price < stop_loss:
+                        # 비중을 늘리면 보상 (변화량이 클수록 보상)
+                        if new_position > position_scalar:  # 포지션 증가
+                            reward = float(reward + lstm_position_bonus * position_change * lstm_bonus_scale)
+                        # 비중을 줄이면 페널티
+                        elif new_position < position_scalar:  # 포지션 감소
+                            reward = float(reward - lstm_position_bonus * position_change * lstm_penalty_scale)
+                except:
+                    pass
+            
+            # 포지션 업데이트 (스칼라로 보장)
+            if hasattr(new_position, '__len__') and not isinstance(new_position, str):
+                self.position = float(np.asarray(new_position).flatten()[0])
+            else:
+                self.position = float(new_position)
+            
             self.current_step += 1
             
             # 종료 조건
@@ -192,24 +473,43 @@ if GYM_AVAILABLE and STABLE_BASELINES3_AVAILABLE:
             return observation, reward, terminated, truncated, info
         
         def _get_observation(self):
-            """관측값 생성 (개선된 구성)"""
+            """관측값 생성 (XGBoost/LSTM 정보 포함)"""
             if self.current_step >= len(self.price_data):
-                return np.zeros(12)
+                observation_size = self.config.get('observation_space_size', 14)
+                return np.zeros(observation_size)
             
-            current_price = self.price_data[self.current_step]
+            # 가격을 스칼라로 안전하게 변환
+            current_price_val = self.price_data[self.current_step]
+            if hasattr(current_price_val, '__len__') and not isinstance(current_price_val, str):
+                current_price = float(np.asarray(current_price_val).flatten()[0])
+            else:
+                current_price = float(current_price_val)
             
             # 가격 변화율
             price_change = 0.0
             if self.current_step > 0:
-                price_change = (current_price - self.price_data[self.current_step - 1]) / self.price_data[self.current_step - 1]
+                prev_price_val = self.price_data[self.current_step - 1]
+                if hasattr(prev_price_val, '__len__') and not isinstance(prev_price_val, str):
+                    prev_price = float(np.asarray(prev_price_val).flatten()[0])
+                else:
+                    prev_price = float(prev_price_val)
+                price_change = (current_price - prev_price) / prev_price if prev_price > 0 else 0.0
             
             # 단기/장기 이동평균 (간단한 추세 지표)
             ma_short = current_price
             ma_long = current_price
             if self.current_step >= 5:
-                ma_short = np.mean(self.price_data[max(0, self.current_step-5):self.current_step+1])
+                ma_short_val = np.mean(self.price_data[max(0, self.current_step-5):self.current_step+1])
+                if hasattr(ma_short_val, '__len__') and not isinstance(ma_short_val, str):
+                    ma_short = float(np.asarray(ma_short_val).flatten()[0])
+                else:
+                    ma_short = float(ma_short_val)
             if self.current_step >= 20:
-                ma_long = np.mean(self.price_data[max(0, self.current_step-20):self.current_step+1])
+                ma_long_val = np.mean(self.price_data[max(0, self.current_step-20):self.current_step+1])
+                if hasattr(ma_long_val, '__len__') and not isinstance(ma_long_val, str):
+                    ma_long = float(np.asarray(ma_long_val).flatten()[0])
+                else:
+                    ma_long = float(ma_long_val)
             
             # 변동성 (최근 10일)
             volatility = 0.01
@@ -217,29 +517,99 @@ if GYM_AVAILABLE and STABLE_BASELINES3_AVAILABLE:
                 recent_prices = self.price_data[max(0, self.current_step-10):self.current_step+1]
                 if len(recent_prices) > 1:
                     returns = np.diff(recent_prices) / recent_prices[:-1]
-                    volatility = np.std(returns) if len(returns) > 0 else 0.01
+                    volatility_val = np.std(returns) if len(returns) > 0 else 0.01
+                    if hasattr(volatility_val, '__len__') and not isinstance(volatility_val, str):
+                        volatility = float(np.asarray(volatility_val).flatten()[0])
+                    else:
+                        volatility = float(volatility_val)
             
             # 모멘텀 (최근 5일 수익률)
             momentum = 0.0
             if self.current_step >= 5:
-                momentum = (current_price - self.price_data[self.current_step - 5]) / self.price_data[self.current_step - 5]
+                prev_price_5_val = self.price_data[self.current_step - 5]
+                if hasattr(prev_price_5_val, '__len__') and not isinstance(prev_price_5_val, str):
+                    prev_price_5 = float(np.asarray(prev_price_5_val).flatten()[0])
+                else:
+                    prev_price_5 = float(prev_price_5_val)
+                momentum = (current_price - prev_price_5) / prev_price_5 if prev_price_5 > 0 else 0.0
+            
+            # XGBoost/LSTM 예측 정보 (학습 시에도 포함)
+            buy_prob = 0.5
+            sell_prob = 0.5
+            target_price_ratio = 1.02
+            stop_loss_ratio = 0.98
+            price_confidence = 0.5
+            
+            if self.xgb_model is not None and self.features_data is not None and self.current_step < len(self.features_data):
+                try:
+                    features = self.features_data.iloc[self.current_step].values.reshape(1, -1)
+                    direction_pred = self.xgb_model.predict_proba(features)[0]
+                    direction_pred = np.asarray(direction_pred).flatten()  # 1차원 배열로 변환
+                    if len(direction_pred) >= 3:
+                        # 배열 요소를 스칼라로 안전하게 변환
+                        buy_prob_val = direction_pred[1]
+                        if hasattr(buy_prob_val, '__len__') and not isinstance(buy_prob_val, str):
+                            buy_prob = float(np.asarray(buy_prob_val).flatten()[0])
+                        else:
+                            buy_prob = float(buy_prob_val)
+                        
+                        sell_prob_val = direction_pred[2]
+                        if hasattr(sell_prob_val, '__len__') and not isinstance(sell_prob_val, str):
+                            sell_prob = float(np.asarray(sell_prob_val).flatten()[0])
+                        else:
+                            sell_prob = float(sell_prob_val)
+                except:
+                    pass
+            
+            if self.lstm_model is not None and self.sequences_data is not None and self.current_step < len(self.sequences_data):
+                try:
+                    sequence = self.sequences_data[self.current_step].reshape(1, -1, 5)  # (1, sequence_length, 5)
+                    price_pred = self.lstm_model.predict(sequence, current_price=current_price)
+                    # 배열을 스칼라로 안전하게 변환
+                    target_price_val = price_pred.get('target_price', current_price * 1.02)
+                    stop_loss_val = price_pred.get('stop_loss', current_price * 0.98)
+                    target_price = float(np.asarray(target_price_val).flatten()[0]) if hasattr(target_price_val, '__len__') else float(target_price_val)
+                    stop_loss = float(np.asarray(stop_loss_val).flatten()[0]) if hasattr(stop_loss_val, '__len__') else float(stop_loss_val)
+                    target_price_ratio = target_price / current_price if current_price > 0 else 1.02
+                    stop_loss_ratio = stop_loss / current_price if current_price > 0 else 0.98
+                    price_confidence_val = price_pred.get('price_confidence', 0.5)
+                    price_confidence = float(np.asarray(price_confidence_val).flatten()[0]) if hasattr(price_confidence_val, '__len__') else float(price_confidence_val)
+                except:
+                    pass
             
             price_normalization = self.config.get('price_normalization', 200)
-            observation_size = self.config.get('observation_space_size', 12)
+            observation_size = self.config.get('observation_space_size', 14)  # XGBoost/LSTM 정보 추가로 14차원
             
+            # position을 스칼라로 변환
+            position_val = self.position
+            if hasattr(position_val, '__len__') and not isinstance(position_val, str):
+                position_scalar = float(np.asarray(position_val).flatten()[0])
+            else:
+                position_scalar = float(position_val)
+            
+            # balance를 스칼라로 변환
+            balance_val = self.balance
+            if hasattr(balance_val, '__len__') and not isinstance(balance_val, str):
+                balance_scalar = float(np.asarray(balance_val).flatten()[0])
+            else:
+                balance_scalar = float(balance_val)
+            
+            # 모든 값을 스칼라로 보장
             obs = [
-                self.position,  # 현재 포지션
-                self.balance / self.initial_balance,  # 정규화된 잔액
-                current_price / price_normalization,  # 정규화된 가격
-                price_change,  # 가격 변화율
-                (ma_short - ma_long) / current_price if current_price > 0 else 0,  # 이동평균 차이
-                momentum,  # 모멘텀
-                volatility,  # 변동성
-                min(self.current_step / 1000.0, 1.0),  # 시간 정규화
-                0.5,  # direction_signal (실제로는 XGBoost 예측 사용)
-                0.5,  # price_target (실제로는 LSTM 예측 사용)
-                0.5,  # confidence
-                1.0 if self.position != 0.0 else 0.0  # 포지션 보유 여부
+                float(position_scalar),  # [0] 현재 포지션
+                float(balance_scalar / self.initial_balance),  # [1] 정규화된 잔액
+                float(current_price / price_normalization),  # [2] 정규화된 가격
+                float(price_change),  # [3] 가격 변화율
+                float((ma_short - ma_long) / current_price if current_price > 0 else 0),  # [4] 이동평균 차이
+                float(momentum),  # [5] 모멘텀
+                float(volatility),  # [6] 변동성
+                float(min(self.current_step / 1000.0, 1.0)),  # [7] 시간 정규화
+                float(buy_prob),  # [8] XGBoost BUY 확률
+                float(sell_prob),  # [9] XGBoost SELL 확률
+                float(target_price_ratio),  # [10] LSTM 목표가 비율
+                float(stop_loss_ratio),  # [11] LSTM 손절가 비율
+                float(price_confidence),  # [12] LSTM 신뢰도
+                float(1.0 if position_scalar != 0.0 else 0.0)  # [13] 포지션 보유 여부
             ]
             
             # observation_space_size에 맞게 조정
@@ -307,12 +677,17 @@ class TradingRLAgent:
         self.training_episodes = []  # 에피소드 기록
         print("[샘플] 강화학습 Agent 초기화")
     
-    def train(self, price_data: np.ndarray):
+    def train(self, price_data: np.ndarray, xgb_model=None, lstm_model=None, 
+              features_data=None, sequences_data=None):
         """
         Agent 학습
         
         Args:
             price_data: 가격 데이터 배열
+            xgb_model: XGBoost 모델 (학습 시 observation에 포함)
+            lstm_model: LSTM 모델 (학습 시 observation에 포함)
+            features_data: XGBoost용 피처 데이터 (DataFrame)
+            sequences_data: LSTM용 시퀀스 데이터 (numpy array)
         """
         if not STABLE_BASELINES3_AVAILABLE or not GYM_AVAILABLE:
             print("[샘플] stable-baselines3 또는 gym이 설치되지 않아 강화학습을 건너뜁니다.")
@@ -321,35 +696,146 @@ class TradingRLAgent:
         
         try:
             print(f"[샘플] 강화학습 학습 시작: {len(price_data)}개 데이터 포인트")
+            if xgb_model is not None:
+                print("[샘플] XGBoost 모델 정보를 학습에 포함합니다.")
+            if lstm_model is not None:
+                print("[샘플] LSTM 모델 정보를 학습에 포함합니다.")
             
-            # 환경 생성 (설정 전달)
+            # 환경 생성 (XGBoost/LSTM 모델 포함)
             initial_balance = self.config.get('initial_balance', 100000)
-            env = SimpleTradingEnv(price_data, initial_balance=initial_balance, config=self.config)
+            env = SimpleTradingEnv(
+                price_data, 
+                initial_balance=initial_balance, 
+                config=self.config,
+                xgb_model=xgb_model,
+                lstm_model=lstm_model,
+                features_data=features_data,
+                sequences_data=sequences_data
+            )
             
-            # PPO Agent 생성
+            # RL Agent 생성 (알고리즘 선택 가능)
+            algorithm_name = self.config.get('algorithm', 'PPO').upper()
+            if algorithm_name not in RL_ALGORITHMS:
+                print(f"[샘플] 경고: 지원하지 않는 알고리즘 '{algorithm_name}', PPO 사용")
+                algorithm_name = 'PPO'
+            
+            AlgorithmClass = RL_ALGORITHMS[algorithm_name]
+            print(f"[샘플] {algorithm_name} 알고리즘 사용")
+            
             # learning_rate를 float로 변환 (YAML에서 문자열로 읽힐 수 있음)
             lr = self.config.get('learning_rate', 3e-4)
             if isinstance(lr, str):
                 lr = float(lr)
             
-            self.agent = PPO(
-                'MlpPolicy',
-                env,
-                learning_rate=lr,
-                n_steps=self.config.get('n_steps', 256),
-                batch_size=self.config.get('batch_size', 128),
-                n_epochs=self.config.get('n_epochs', 10),
-                gamma=self.config.get('gamma', 0.99),
-                ent_coef=self.config.get('ent_coef', 0.05),
-                vf_coef=self.config.get('vf_coef', 0.5),
-                max_grad_norm=self.config.get('max_grad_norm', 0.5),
-                clip_range=self.config.get('clip_range', 0.2),
-                verbose=1
-            )
+            # 공통 파라미터
+            common_params = {
+                'policy': 'MlpPolicy',
+                'env': env,
+                'learning_rate': lr,
+                'gamma': self.config.get('gamma', 0.99),
+                'verbose': 1
+            }
             
-            # 학습 중 보상 수집을 위한 콜백 (간단한 방법)
-            # 학습 (프로그레스바 활성화)
-            self.agent.learn(total_timesteps=self.config['total_timesteps'], progress_bar=True)
+            # 알고리즘별 파라미터 설정
+            if algorithm_name in ['PPO', 'A2C']:
+                # On-policy 알고리즘 (PPO, A2C)
+                algorithm_params = {
+                    'n_steps': self.config.get('n_steps', 256),
+                    'ent_coef': self.config.get('ent_coef', 0.05),
+                    'vf_coef': self.config.get('vf_coef', 0.5),
+                    'max_grad_norm': self.config.get('max_grad_norm', 0.5),
+                }
+                if algorithm_name == 'PPO':
+                    algorithm_params['batch_size'] = self.config.get('batch_size', 128)
+                    algorithm_params['n_epochs'] = self.config.get('n_epochs', 10)
+                    algorithm_params['clip_range'] = self.config.get('clip_range', 0.2)
+                elif algorithm_name == 'A2C':
+                    algorithm_params['gae_lambda'] = self.config.get('gae_lambda', 0.95)
+                    algorithm_params['use_sde'] = self.config.get('use_sde', False)
+                    if algorithm_params['use_sde']:
+                        algorithm_params['sde_sample_freq'] = self.config.get('sde_sample_freq', -1)
+            elif algorithm_name in ['DQN']:
+                # DQN (Discrete action space는 현재 환경과 맞지 않지만 지원)
+                algorithm_params = {
+                    'buffer_size': self.config.get('buffer_size', 100000),
+                    'learning_starts': self.config.get('learning_starts', 1000),
+                    'batch_size': self.config.get('batch_size', 32),
+                    'tau': self.config.get('tau', 1.0),
+                    'gamma': self.config.get('gamma', 0.99),
+                    'train_freq': self.config.get('dqn_train_freq', 4),
+                    'gradient_steps': self.config.get('gradient_steps', 1),
+                    'target_update_interval': self.config.get('dqn_target_update_interval', 1000),
+                }
+            elif algorithm_name in ['SAC', 'TD3', 'DDPG']:
+                # Off-policy 알고리즘 (SAC, TD3, DDPG)
+                algorithm_params = {
+                    'buffer_size': self.config.get('buffer_size', 100000),
+                    'learning_starts': self.config.get('learning_starts', 1000),
+                    'batch_size': self.config.get('batch_size', 256),
+                    'tau': self.config.get('tau', 0.005),
+                    'gamma': self.config.get('gamma', 0.99),
+                    'train_freq': self.config.get('train_freq', 1),
+                    'gradient_steps': self.config.get('gradient_steps', 1),
+                }
+                if algorithm_name == 'SAC':
+                    algorithm_params['ent_coef'] = self.config.get('ent_coef', 'auto')
+                    algorithm_params['target_update_interval'] = self.config.get('sac_target_update_interval', 1)
+                elif algorithm_name in ['TD3', 'DDPG']:
+                    algorithm_params['policy_delay'] = self.config.get('policy_delay', 2) if algorithm_name == 'TD3' else None
+                    algorithm_params['target_policy_noise'] = self.config.get('target_policy_noise', 0.2) if algorithm_name == 'TD3' else None
+                    algorithm_params['target_noise_clip'] = self.config.get('target_noise_clip', 0.5) if algorithm_name == 'TD3' else None
+            
+            # 모든 파라미터 병합
+            all_params = {**common_params, **algorithm_params}
+            # None 값 제거
+            all_params = {k: v for k, v in all_params.items() if v is not None}
+            
+            self.agent = AlgorithmClass(**all_params)
+            
+            # 조기 종료 콜백 설정 (모든 알고리즘에 적용)
+            callbacks = None
+            enable_early_stopping = self.config.get('enable_early_stopping', False)
+            early_stopping_patience = self.config.get('early_stopping_patience', 10)
+            eval_freq = self.config.get('eval_freq', 5000)
+            
+            if enable_early_stopping and STABLE_BASELINES3_AVAILABLE:
+                try:
+                    from stable_baselines3.common.callbacks import EvalCallback, StopTrainingOnNoModelImprovement
+                    
+                    # 검증 환경 생성 (학습 데이터의 일부를 검증용으로 사용)
+                    # 간단하게 동일한 환경을 검증 환경으로 사용 (실제로는 별도 데이터가 필요)
+                    val_env = env  # 실제로는 별도 검증 데이터로 환경을 만들어야 함
+                    
+                    # 조기 종료 조건: patience회 평가 동안 개선이 없으면 종료
+                    stop_callback = StopTrainingOnNoModelImprovement(
+                        max_no_improvement_evals=early_stopping_patience,
+                        min_evals=5,  # 최소 5회는 평가
+                        verbose=1
+                    )
+                    
+                    # 평가 콜백: 주기적으로 검증 환경에서 평가
+                    eval_callback = EvalCallback(
+                        val_env,
+                        best_model_save_path=None,  # 모델 저장은 별도로 처리
+                        log_path=None,
+                        eval_freq=eval_freq,
+                        deterministic=True,
+                        render=False,
+                        callback_on_new_best=stop_callback,
+                        verbose=1
+                    )
+                    callbacks = [eval_callback]
+                    print(f"[샘플] 조기 종료 활성화: {early_stopping_patience}회 평가 동안 개선 없으면 종료 (eval_freq: {eval_freq})")
+                except Exception as e:
+                    print(f"[샘플] 조기 종료 콜백 설정 실패: {e}, 조기 종료 없이 학습 진행")
+                    callbacks = None
+            
+            # 학습 (프로그레스바 활성화, 콜백 포함)
+            self.agent.learn(
+                total_timesteps=self.config['total_timesteps'], 
+                progress_bar=True,
+                callback=callbacks
+            )
             
             # 학습 후 평가를 통해 보상 곡선 생성
             self._collect_training_metrics(env)
@@ -381,27 +867,83 @@ class TradingRLAgent:
         # 상태를 관측 벡터로 변환
         obs = self._state_to_observation(state)
         
-        # 예측 (Discrete action이므로 단일 정수 반환)
-        action, _ = self.agent.predict(obs, deterministic=True)
+        # 예측 (Box action: [position_size])
+        # deterministic=False로 변경하여 탐험 허용 (학습된 정책의 다양성 활용)
+        action, _ = self.agent.predict(obs, deterministic=False)
         
-        position_size = self.config.get('position_size', 0.3)
+        # Action: [position_size] - 주식은 position_size만 사용
+        # position_size: 0.0 (청산) ~ 1.0 (최대 롱)
+        # action을 1차원 배열로 변환하고 스칼라로 추출
+        action = np.asarray(action).flatten()
+        action = np.clip(action, 0.0, 1.0)
+        
+        # position_size 추출 및 이산화 (10% 단위로만 선택 가능)
+        if len(action) > 0:
+            position_size_val = action[0]
+            if hasattr(position_size_val, '__len__') and not isinstance(position_size_val, str):
+                position_size = float(np.asarray(position_size_val).flatten()[0])
+            else:
+                position_size = float(position_size_val)
+        else:
+            position_size = 0.0
+        
+        position_size = float(np.clip(position_size, 0.0, 1.0))
+        
+        # 액션 이산화: 10% 단위로만 선택 가능 (0.0, 0.1, 0.2, ..., 1.0)
+        # 학습 환경과 동일하게 이산화하여 일관성 유지
+        min_meaningful_change = self.config.get('min_meaningful_position_change', 0.10)
+        position_size_before_discretize = position_size
+        position_size = round(position_size / min_meaningful_change) * min_meaningful_change
+        position_size = float(np.clip(position_size, 0.0, 1.0))
+        
+        # action_type 제거: position_size만 반환
         return {
-            'action_type': int(action),  # Discrete action: 0, 1, 또는 2
-            'position_size': position_size,
+            'position_size': position_size,  # RL이 학습한 목표 포지션 크기
             'confidence': 0.7  # 샘플이므로 고정값
         }
     
     def _state_to_observation(self, state: Dict) -> np.ndarray:
-        """상태를 관측 벡터로 변환 (12차원)"""
+        """상태를 관측 벡터로 변환 (14차원, 학습 환경과 동일)"""
         direction = state.get('direction', {})
         price_target = state.get('price_target', {})
         current_state = state.get('current_state', {})
         
-        current_price = current_state.get('current_price', 100.0)
-        buy_prob = direction.get('buy_prob', 0.5)
-        sell_prob = direction.get('sell_prob', 0.5)
-        target_price = price_target.get('target_price', current_price * 1.02)
-        stop_loss = price_target.get('stop_loss', current_price * 0.98)
+        # 값들을 스칼라로 안전하게 변환
+        current_price_val = current_state.get('current_price', 100.0)
+        if hasattr(current_price_val, '__len__') and not isinstance(current_price_val, str):
+            current_price = float(np.asarray(current_price_val).flatten()[0])
+        else:
+            current_price = float(current_price_val)
+        
+        buy_prob_val = direction.get('buy_prob', 0.5)
+        if hasattr(buy_prob_val, '__len__') and not isinstance(buy_prob_val, str):
+            buy_prob = float(np.asarray(buy_prob_val).flatten()[0])
+        else:
+            buy_prob = float(buy_prob_val)
+        
+        sell_prob_val = direction.get('sell_prob', 0.5)
+        if hasattr(sell_prob_val, '__len__') and not isinstance(sell_prob_val, str):
+            sell_prob = float(np.asarray(sell_prob_val).flatten()[0])
+        else:
+            sell_prob = float(sell_prob_val)
+        
+        target_price_val = price_target.get('target_price', current_price * 1.02)
+        if hasattr(target_price_val, '__len__') and not isinstance(target_price_val, str):
+            target_price = float(np.asarray(target_price_val).flatten()[0])
+        else:
+            target_price = float(target_price_val)
+        
+        stop_loss_val = price_target.get('stop_loss', current_price * 0.98)
+        if hasattr(stop_loss_val, '__len__') and not isinstance(stop_loss_val, str):
+            stop_loss = float(np.asarray(stop_loss_val).flatten()[0])
+        else:
+            stop_loss = float(stop_loss_val)
+        
+        price_confidence_val = price_target.get('price_confidence', 0.5)
+        if hasattr(price_confidence_val, '__len__') and not isinstance(price_confidence_val, str):
+            price_confidence = float(np.asarray(price_confidence_val).flatten()[0])
+        else:
+            price_confidence = float(price_confidence_val)
         
         # 가격 변화율 (간단히 0으로 설정, 실제로는 이전 가격 필요)
         price_change = 0.0
@@ -412,26 +954,50 @@ class TradingRLAgent:
         # 모멘텀 (간단히 0으로 설정)
         momentum = 0.0
         
-        # 변동성
-        volatility = current_state.get('market_volatility', 0.01)
+        # 변동성 (스칼라로 안전하게 변환)
+        volatility_val = current_state.get('market_volatility', 0.01)
+        if hasattr(volatility_val, '__len__') and not isinstance(volatility_val, str):
+            volatility = float(np.asarray(volatility_val).flatten()[0])
+        else:
+            volatility = float(volatility_val)
+        
+        # 목표가/손절가 비율
+        target_price_ratio = target_price / current_price if current_price > 0 else 1.02
+        stop_loss_ratio = stop_loss / current_price if current_price > 0 else 0.98
         
         price_normalization = self.config.get('price_normalization', 200)
-        observation_size = self.config.get('observation_space_size', 12)
+        observation_size = self.config.get('observation_space_size', 14)  # 학습 환경과 동일
         initial_balance = self.config.get('initial_balance', 100000)
         
+        # current_position과 balance를 스칼라로 변환
+        current_position_val = current_state.get('current_position', 0.0)
+        if hasattr(current_position_val, '__len__') and not isinstance(current_position_val, str):
+            current_position = float(np.asarray(current_position_val).flatten()[0])
+        else:
+            current_position = float(current_position_val)
+        
+        balance_val = current_state.get('balance', initial_balance)
+        if hasattr(balance_val, '__len__') and not isinstance(balance_val, str):
+            balance = float(np.asarray(balance_val).flatten()[0])
+        else:
+            balance = float(balance_val)
+        
+        # 모든 값을 스칼라로 보장
         obs = [
-            current_state.get('current_position', 0.0),  # 현재 포지션
-            current_state.get('balance', initial_balance) / initial_balance,  # 정규화된 잔액
-            current_price / price_normalization,  # 정규화된 가격
-            price_change,  # 가격 변화율
-            ma_diff,  # 이동평균 차이
-            momentum,  # 모멘텀
-            volatility,  # 변동성
-            0.5,  # 시간 정규화 (샘플이므로 고정값)
-            buy_prob,  # XGBoost BUY 확률
-            sell_prob,  # XGBoost SELL 확률
-            direction.get('confidence', 0.5),  # 신뢰도
-            1.0 if current_state.get('current_position', 0.0) != 0.0 else 0.0  # 포지션 보유 여부
+            float(current_position),  # [0] 현재 포지션
+            float(balance / initial_balance),  # [1] 정규화된 잔액
+            float(current_price / price_normalization),  # [2] 정규화된 가격
+            float(price_change),  # [3] 가격 변화율
+            float(ma_diff),  # [4] 이동평균 차이
+            float(momentum),  # [5] 모멘텀
+            float(volatility),  # [6] 변동성
+            float(0.5),  # [7] 시간 정규화 (샘플이므로 고정값)
+            float(buy_prob),  # [8] XGBoost BUY 확률
+            float(sell_prob),  # [9] XGBoost SELL 확률
+            float(target_price_ratio),  # [10] LSTM 목표가 비율
+            float(stop_loss_ratio),  # [11] LSTM 손절가 비율
+            float(price_confidence),  # [12] LSTM 신뢰도
+            float(1.0 if current_position != 0.0 else 0.0)  # [13] 포지션 보유 여부
         ]
         
         # observation_space_size에 맞게 조정
@@ -458,8 +1024,15 @@ class TradingRLAgent:
             # 환경이 필요하므로 임시 환경 생성
             initial_balance = self.config.get('initial_balance', 100000)
             temp_env = SimpleTradingEnv(np.array([100, 101, 102]), initial_balance=initial_balance, config=self.config)
-            self.agent = PPO.load(filepath, env=temp_env)
-            print(f"[샘플] 모델 로드 완료: {filepath}")
+            
+            # 알고리즘 확인 (파일명이나 메타데이터에서 추출 가능하지만, 일단 config에서 읽기)
+            algorithm_name = self.config.get('algorithm', 'PPO').upper()
+            if algorithm_name not in RL_ALGORITHMS:
+                algorithm_name = 'PPO'
+            
+            AlgorithmClass = RL_ALGORITHMS[algorithm_name]
+            self.agent = AlgorithmClass.load(filepath, env=temp_env)
+            print(f"[샘플] 모델 로드 완료: {filepath} ({algorithm_name})")
         except Exception as e:
             print(f"[샘플] 모델 로드 실패: {e}")
             self.agent = None
@@ -486,9 +1059,19 @@ class TradingRLAgent:
                 obs, reward, terminated, truncated, _ = env.step(action)
                 done = terminated or truncated
                 
-                episode_reward += reward
+                # reward를 스칼라로 변환
+                if hasattr(reward, '__len__') and not isinstance(reward, str):
+                    reward_scalar = float(np.asarray(reward).flatten()[0])
+                else:
+                    reward_scalar = float(reward)
+                episode_reward = float(episode_reward + reward_scalar)
                 episode_length += 1
-                actions_in_episode.append(int(action))
+                # action을 스칼라로 변환 후 int로 변환
+                if hasattr(action, '__len__') and not isinstance(action, str):
+                    action_scalar = float(np.asarray(action).flatten()[0])
+                else:
+                    action_scalar = float(action)
+                actions_in_episode.append(int(action_scalar))
             
             episode_rewards.append(episode_reward)
             episode_lengths.append(episode_length)
@@ -570,10 +1153,35 @@ class TradingRLAgent:
             obs, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
             
-            rewards.append(float(reward))
-            actions.append(int(action))
-            positions.append(float(env.position))
-            prices.append(float(price_data[min(env.current_step, len(price_data)-1)]))
+            # reward를 스칼라로 변환
+            if hasattr(reward, '__len__') and not isinstance(reward, str):
+                reward_scalar = float(np.asarray(reward).flatten()[0])
+            else:
+                reward_scalar = float(reward)
+            rewards.append(reward_scalar)
+            
+            # action을 스칼라로 변환 후 int로 변환
+            if hasattr(action, '__len__') and not isinstance(action, str):
+                action_scalar = float(np.asarray(action).flatten()[0])
+            else:
+                action_scalar = float(action)
+            actions.append(int(action_scalar))
+            
+            # env.position을 스칼라로 변환
+            position_val = env.position
+            if hasattr(position_val, '__len__') and not isinstance(position_val, str):
+                position_scalar = float(np.asarray(position_val).flatten()[0])
+            else:
+                position_scalar = float(position_val)
+            positions.append(position_scalar)
+            
+            # price를 스칼라로 변환
+            price_val = price_data[min(env.current_step, len(price_data)-1)]
+            if hasattr(price_val, '__len__') and not isinstance(price_val, str):
+                price_scalar = float(np.asarray(price_val).flatten()[0])
+            else:
+                price_scalar = float(price_val)
+            prices.append(price_scalar)
             
             step_count += 1
         

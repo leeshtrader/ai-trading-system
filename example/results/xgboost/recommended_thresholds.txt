@@ -1,0 +1,10 @@
+추천 임계값 설정:
+  buy_threshold: 0.400
+  sell_threshold: 0.400
+  strong_signal_threshold: 0.500
+
+분석 근거:
+  - F1-score 최적화 임계값: 0.340
+  - 균형 잡힌 임계값: 0.300
+  - 통계적 근거 (BUY): 0.500
+  - 통계적 근거 (SELL): 0.533

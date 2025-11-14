@@ -67,15 +67,10 @@ class RoleBasedEnsemble:
         
         # 설정 파일에서 값 읽기
         default_current_price = self.ensemble_config.get('default_current_price', 150.0)
+        # buy_threshold, sell_threshold는 XGBoost 신호 분석용 (포지션 크기 계산에는 사용 안 함)
         buy_threshold = self.ensemble_config.get('buy_threshold', 0.35)
         sell_threshold = self.ensemble_config.get('sell_threshold', 0.35)
         strong_signal_threshold = self.ensemble_config.get('strong_signal_threshold', 0.4)
-        base_position_size_multiplier = self.ensemble_config.get('base_position_size_multiplier', 0.4)
-        max_position_size = self.ensemble_config.get('max_position_size', 0.4)
-        rl_match_position_multiplier = self.ensemble_config.get('rl_match_position_multiplier', 1.2)
-        max_position_size_rl_match = self.ensemble_config.get('max_position_size_rl_match', 0.5)
-        default_target_ratio = self.config.get('labeling', {}).get('default_target_ratio', 1.02)
-        default_stop_loss_ratio = self.config.get('labeling', {}).get('default_stop_loss_ratio', 0.98)
         
         # 2. LSTM 가격 예측 (현재 가격 전달)
         current_price = current_state.get('current_price', default_current_price)
@@ -96,43 +91,62 @@ class RoleBasedEnsemble:
         hold_prob = direction_pred.get('hold_prob', 0.0)
         price_confidence = price_pred.get('price_confidence', 0.5)
         
-        # RL Agent의 결정
-        rl_action_type = rl_action['action_type']
+        # RL Agent의 최종 결정: position_size만 사용
+        # XGBoost는 확률만 제공 (RL의 입력으로 사용), LSTM은 목표가/손절가만 제공
+        # RL이 목표 포지션 크기(position_size)를 결정
+        position_size = rl_action.get('position_size', 0.0)
         
-        # RL Agent가 HOLD를 반환하더라도, XGBoost/LSTM의 신호가 강하면 거래 실행
-        # RL Agent는 "필터" 역할: 신호가 약하면 HOLD, 강하면 거래 허용
-        if rl_action_type == 0:  # RL Agent가 HOLD
-            # XGBoost/LSTM의 신호 강도 확인
-            if buy_prob > buy_threshold and buy_prob > sell_prob and buy_prob > hold_prob:
-                action_type = 1  # BUY
-                position_size = min(buy_prob * base_position_size_multiplier, max_position_size)
-            elif sell_prob > sell_threshold and sell_prob > buy_prob and sell_prob > hold_prob:
-                action_type = 2  # SELL
-                position_size = min(sell_prob * base_position_size_multiplier, max_position_size)
-            else:
-                action_type = 0  # HOLD
-                position_size = 0.0
-        else:
-            # RL Agent가 BUY/SELL을 반환한 경우
-            # RL Agent의 결정을 우선하되, XGBoost/LSTM 신호와 일치하면 더 큰 포지션
-            action_type = rl_action_type
-            base_size = rl_action['position_size']
+        # 목표가/손절가 계산 (변동성 기반 또는 LSTM 예측값 사용)
+        labeling_config = self.config.get('labeling', {})
+        
+        # 변동성 기반 계산
+        market_volatility = current_state.get('market_volatility', 0.01)
+        volatility_multiplier = labeling_config.get('volatility_multiplier', 2.0)
+        consider_transaction_cost = labeling_config.get('consider_transaction_cost', True)
+        
+        # 수수료 고려한 최소/최대 기준 계산
+        if consider_transaction_cost:
+            # 백테스트 설정에서 수수료율 읽기
+            backtest_config = self.config.get('backtest', {})
+            transaction_cost_rate = backtest_config.get('transaction_cost_rate', 0.001)  # 0.1%
+            total_transaction_cost = transaction_cost_rate * 2  # 매수 + 매도 = 2배
             
-            # XGBoost/LSTM 신호와 일치하면 포지션 크기 증가
-            if action_type == 1 and buy_prob > strong_signal_threshold:  # BUY 신호 일치
-                position_size = min(base_size * rl_match_position_multiplier, max_position_size_rl_match)
-            elif action_type == 2 and sell_prob > strong_signal_threshold:  # SELL 신호 일치
-                position_size = min(base_size * rl_match_position_multiplier, max_position_size_rl_match)
-            else:
-                position_size = base_size
+            # 최소 익절: 수수료 + 최소 순수익(1.3%)
+            min_target_ratio_base = labeling_config.get('min_target_ratio', 1.015)
+            min_target_ratio = max(min_target_ratio_base, 1.0 + total_transaction_cost + 0.013)
+            
+            # 최대 손절: 수수료 + 최소 손실 허용(1.3%)
+            max_stop_loss_ratio_base = labeling_config.get('max_stop_loss_ratio', 0.985)
+            max_stop_loss_ratio = min(max_stop_loss_ratio_base, 1.0 - total_transaction_cost - 0.013)
+        else:
+            min_target_ratio = labeling_config.get('min_target_ratio', 1.015)
+            max_stop_loss_ratio = labeling_config.get('max_stop_loss_ratio', 0.985)
         
-        target_price = price_pred.get('target_price', current_state.get('current_price', 0) * default_target_ratio)
-        stop_loss = price_pred.get('stop_loss', current_state.get('current_price', 0) * default_stop_loss_ratio)
-        confidence = self._calculate_confidence(direction_pred, price_pred, rl_action)
+        max_target_ratio = labeling_config.get('max_target_ratio', 1.15)
+        min_stop_loss_ratio = labeling_config.get('min_stop_loss_ratio', 0.85)
+        
+        # 변동성 기반 비율 계산 (2시그마 등)
+        if market_volatility > 0:
+            target_ratio = 1.0 + (market_volatility * volatility_multiplier)
+            stop_loss_ratio = 1.0 - (market_volatility * volatility_multiplier)
+            # 최소/최대 비율로 제한
+            target_ratio = np.clip(target_ratio, min_target_ratio, max_target_ratio)
+            stop_loss_ratio = np.clip(stop_loss_ratio, min_stop_loss_ratio, max_stop_loss_ratio)
+        else:
+            # 변동성이 없으면 최소/최대 범위의 중간값 사용
+            target_ratio = (min_target_ratio + max_target_ratio) / 2.0
+            stop_loss_ratio = (min_stop_loss_ratio + max_stop_loss_ratio) / 2.0
+        
+        # LSTM 예측값이 있으면 우선 사용, 없으면 변동성 기반 값 사용
+        target_price = price_pred.get('target_price', current_price * target_ratio)
+        stop_loss = price_pred.get('stop_loss', current_price * stop_loss_ratio)
+        
+        # 신뢰도: RL의 confidence만 사용 (XGBoost/LSTM의 실제 신뢰도는 RL의 observation으로 이미 포함됨)
+        confidence = rl_action.get('confidence', 0.5)
         
         # 4. 최종 신호 구성
         signal = {
-            'action': self._action_type_to_string(action_type),
+            'action': 'BUY' if position_size > 0.0 else 'HOLD',  # 로깅용 (실제로는 position_size만 사용)
             'size': position_size,
             'target_price': target_price,
             'stop_loss': stop_loss,
@@ -145,27 +159,4 @@ class RoleBasedEnsemble:
         }
         
         return signal
-    
-    def _action_type_to_string(self, action_type: int) -> str:
-        """행동 타입을 문자열로 변환"""
-        action_map = {0: 'HOLD', 1: 'BUY', 2: 'SELL'}
-        return action_map.get(action_type, 'HOLD')
-    
-    def _calculate_confidence(self, direction: Dict, price: Dict, rl_action: Dict) -> float:
-        """신뢰도 계산"""
-        direction_conf = max(direction.get('buy_prob', 0), direction.get('sell_prob', 0))
-        price_conf = price.get('price_confidence', 0.5)
-        rl_conf = rl_action.get('confidence', 0.5)
-        
-        # 설정 파일에서 가중치 읽기
-        direction_weight = self.ensemble_config.get('direction_weight', 0.3)
-        price_weight = self.ensemble_config.get('price_weight', 0.4)
-        rl_weight = self.ensemble_config.get('rl_weight', 0.3)
-        
-        # 가중 평균
-        return (
-            direction_conf * direction_weight +
-            price_conf * price_weight +
-            rl_conf * rl_weight
-        )
 

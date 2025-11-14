@@ -56,7 +56,7 @@ class FeatureEngineering:
         bb_std = self.fe_config.get('bb_std', 2)
         z_score_window = self.fe_config.get('z_score_window', 20)
         volume_ma_window = self.fe_config.get('volume_ma_window', 20)
-        volatility_window = self.fe_config.get('volatility_window', 20)
+        volatility_window = self.fe_config.get('volatility_window', 60)  # 기본값 60일로 변경 (통계적 신뢰도)
         
         # 추세 추종 지표
         df['ma_5'] = df['close'].rolling(window=ma_5).mean()
@@ -100,7 +100,10 @@ class FeatureEngineering:
     
     def prepare_features_for_xgboost(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        XGBoost용 구조화된 피처 생성
+        XGBoost용 구조화된 피처 생성 (개선 버전)
+        - 모멘텀 피처 추가
+        - 거래량 모멘텀 추가
+        - 변동성 추세 추가
         """
         features = pd.DataFrame({
             # 추세 지표
@@ -121,7 +124,45 @@ class FeatureEngineering:
             'volume_ratio': df['volume_ratio'],
             'volatility': df['volatility'],
             'price_change': df['price_change'],
+            
+            # 모멘텀 피처 (추가)
+            'momentum_3': df['close'].pct_change(3),  # 3일 모멘텀
+            'momentum_5': df['close'].pct_change(5),  # 5일 모멘텀
+            'momentum_10': df['close'].pct_change(10),  # 10일 모멘텀
+            'momentum_20': df['close'].pct_change(20),  # 20일 모멘텀
+            
+            # 거래량 모멘텀 (추가)
+            'volume_momentum_3': df['volume'].pct_change(3),  # 3일 거래량 모멘텀
+            'volume_momentum_5': df['volume'].pct_change(5),  # 5일 거래량 모멘텀
+            'volume_momentum_10': df['volume'].pct_change(10),  # 10일 거래량 모멘텀
+            
+            # 변동성 추세 (추가)
+            'volatility_change': df['volatility'].pct_change(),  # 변동성 변화율
+            'volatility_ma_5': df['volatility'].rolling(5).mean(),  # 변동성 5일 평균
+            'volatility_ma_20': df['volatility'].rolling(20).mean(),  # 변동성 20일 평균
+            'volatility_ratio': df['volatility'] / (df['volatility'].rolling(20).mean() + 1e-8),  # 변동성 비율
+            
+            # 가격 위치 (추가)
+            'high_low_ratio': (df['close'] - df['low']) / (df['high'] - df['low'] + 1e-8),  # 당일 고저 범위 내 위치
+            'close_open_ratio': df['close'] / df['open'] - 1,  # 시가 대비 종가 변화율
+            
+            # 이동평균 교차 (추가)
+            'ma_cross_5_20': (df['ma_5'] - df['ma_20']) / df['ma_20'],  # 5일선과 20일선 차이
+            'ma_cross_20_60': (df['ma_20'] - df['ma_60']) / df['ma_60'],  # 20일선과 60일선 차이
         })
+        
+        # NaN 값 처리: 무한대 값도 NaN으로 변환 후 처리
+        features = features.replace([np.inf, -np.inf], np.nan)
+        
+        # 각 컬럼별로 NaN을 0 또는 중앙값으로 채우기
+        for col in features.columns:
+            if features[col].isna().any():
+                # 중앙값이 계산 가능하면 중앙값으로, 아니면 0으로
+                median_val = features[col].median()
+                if pd.isna(median_val):
+                    features[col] = features[col].fillna(0)
+                else:
+                    features[col] = features[col].fillna(median_val)
         
         return features
     

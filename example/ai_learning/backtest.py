@@ -44,8 +44,7 @@ class Backtester:
         self.position = 0.0  # 현재 포지션 (-1.0 ~ 1.0)
         self.entry_price = 0.0  # 진입가
         self.entry_timestamp = None  # 진입 시점
-        self.target_price = 0.0  # 목표가
-        self.stop_loss = 0.0  # 손절가
+        # 익절/손절 제거: RL의 포지션 관리(비중)로만 리스크 관리
         self.entry_meta = {}  # 진입 시점 메타데이터 (XGB/LSTM/RL)
         self.trade_history = []
         self.signal_history = []  # 신호 기록 (모델별 기여도 분석용)
@@ -86,8 +85,7 @@ class Backtester:
         self.balance = self.initial_balance
         self.position = 0.0
         self.entry_price = 0.0
-        self.target_price = 0.0
-        self.stop_loss = 0.0
+        # 익절/손절 제거: RL의 포지션 관리(비중)로만 리스크 관리
         self.entry_meta = {}
         self.trade_history = []
         self.signal_history = []
@@ -126,6 +124,7 @@ class Backtester:
                 signal = ensemble.generate_signal(test_features, test_sequence, current_state)
                 
                 # 신호 기록 (모델별 기여도 분석용)
+                price_pred = signal.get('reasoning', {}).get('price_prediction', {})
                 self.signal_history.append({
                     'timestamp': data.index[i],
                     'price': current_price,
@@ -133,39 +132,38 @@ class Backtester:
                     'xgb_buy_prob': signal['reasoning']['direction_signal'].get('buy_prob', 0),
                     'xgb_sell_prob': signal['reasoning']['direction_signal'].get('sell_prob', 0),
                     'xgb_hold_prob': signal['reasoning']['direction_signal'].get('hold_prob', 0),
-                    'lstm_target': signal['target_price'],
-                    'lstm_stop_loss': signal['stop_loss'],
-                    'rl_action': signal['reasoning']['rl_decision'].get('action_type', 0),
+                    'lstm_target': price_pred.get('target_price', 0.0),  # 분석용 (RL의 학습 자료)
+                    'lstm_stop_loss': price_pred.get('stop_loss', 0.0),  # 분석용 (RL의 학습 자료)
+                    'rl_position_size': signal['reasoning']['rl_decision'].get('position_size', 0.0),
                     'confidence': signal['confidence']
                 })
                 
-                # 디버깅: 처음 몇 개만 출력
-                if i < start_idx + 5 or signal['action'] != 'HOLD':
-                    print(f"[샘플] 인덱스 {i}, 가격: {current_price:.2f}, 신호: {signal['action']}, "
-                          f"크기: {signal['size']:.2f}, 목표가: {signal['target_price']:.2f}, "
-                          f"손절가: {signal['stop_loss']:.2f}")
+                # 디버깅: 비중 변화가 있을 때만 출력
+                # 신호 해석: 비중 변화가 BUY/SELL을 의미 (비중 증가 = BUY, 비중 감소 = SELL)
+                old_position = self.position
+                new_position = signal['size']
+                position_change = abs(new_position - old_position)
+                
+                # 의미있는 변화가 있을 때만 출력 (10% 단위 이산화 고려)
+                min_change_threshold = 0.05  # 5% 이상 변화 시에만 출력
+                if position_change >= min_change_threshold:
+                    signal_type = "BUY" if new_position > old_position else "SELL"
+                    print(f"[샘플] 인덱스 {i}, 가격: {current_price:.2f}, 신호: {signal_type}, "
+                          f"비중: {old_position:.2f} → {new_position:.2f}")
+                # 처음 몇 개는 항상 출력 (디버깅용)
+                elif i < start_idx + 5:
+                    signal_type = "HOLD" if position_change < 1e-6 else ("BUY" if new_position > old_position else "SELL")
+                    print(f"[샘플] 인덱스 {i}, 가격: {current_price:.2f}, 신호: {signal_type}, "
+                          f"비중: {signal['size']:.2f}")
             except Exception as e:
                 print(f"[샘플] 신호 생성 오류 (인덱스 {i}): {e}")
                 import traceback
                 traceback.print_exc()
                 continue
             
-            # 손절/익절 체크 (포지션이 있을 때만)
-            if self.position != 0.0:
-                if self.position > 0:  # 롱 포지션
-                    if current_price <= self.stop_loss:
-                        self._close_position(current_price, i, data.index[i], reason='손절')
-                    elif current_price >= self.target_price:
-                        self._close_position(current_price, i, data.index[i], reason='익절')
-                else:  # 숏 포지션
-                    if current_price >= abs(self.stop_loss):
-                        self._close_position(current_price, i, data.index[i], reason='손절')
-                    elif current_price <= abs(self.target_price):
-                        self._close_position(current_price, i, data.index[i], reason='익절')
-            
-            # 포지션이 없을 때만 새로운 거래 실행
-            if self.position == 0.0:
-                self._execute_trade(signal, current_price, i, data.index[i])
+            # RL의 포지션 관리: RL이 결정한 action_type과 position_size에 따라 포지션 조절
+            # 익절/손절 없이 비중으로만 리스크 관리
+            self._adjust_position_by_rl(signal, current_price, i, data.index[i])
         
         # 최종 포지션 청산
         if self.position != 0.0:
@@ -188,68 +186,151 @@ class Backtester:
         print("\n[샘플] 백테스트 완료")
         return results
     
-    def _execute_trade(self, signal: Dict, current_price: float, idx: int, timestamp):
-        """거래 실행 (포지션이 없을 때만)"""
+    def _adjust_position_by_rl(self, signal: Dict, current_price: float, idx: int, timestamp):
+        """RL의 포지션 관리: RL이 결정한 position_size에 따라 포지션 조절"""
         action = signal['action']
-        size = signal['size']
-        target_price = signal.get('target_price', current_price * 1.02)
-        stop_loss = signal.get('stop_loss', current_price * 0.98)
+        size = signal['size']  # RL이 결정한 목표 포지션 크기
+        rl_dec = signal.get('reasoning', {}).get('rl_decision', {})
         
-        # 포지션이 없을 때만 새로운 거래 실행
-        if self.position == 0.0:
-            if action == 'BUY' and size > 0:
-                # 매수
-                self.position = min(size, 1.0)
-                self.entry_price = current_price
-                self.entry_timestamp = timestamp
-                self.target_price = target_price
-                self.stop_loss = stop_loss
-                # 진입 메타 저장 (분석용)
-                xgb_sig = signal.get('reasoning', {}).get('direction_signal', {})
-                rl_dec = signal.get('reasoning', {}).get('rl_decision', {})
-                xgb_buy = float(xgb_sig.get('buy_prob', 0.0))
-                xgb_sell = float(xgb_sig.get('sell_prob', 0.0))
-                xgb_hold = float(xgb_sig.get('hold_prob', 0.0))
-                xgb_action = 'BUY' if xgb_buy > max(xgb_sell, xgb_hold) else ('SELL' if xgb_sell > max(xgb_buy, xgb_hold) else 'HOLD')
-                self.entry_meta = {
-                    'entry_action': 'BUY',
-                    'xgb_buy_prob_entry': xgb_buy,
-                    'xgb_sell_prob_entry': xgb_sell,
-                    'xgb_hold_prob_entry': xgb_hold,
-                    'xgb_action_entry': xgb_action,
-                    'lstm_target_entry': float(target_price),
-                    'lstm_stop_entry': float(stop_loss),
-                    'rl_action_entry': int(rl_dec.get('action_type', 0)),
-                }
-                print(f"[샘플] 매수 신호: {timestamp}, 가격: {current_price:.2f}, 크기: {self.position:.2f}, "
-                      f"목표가: {target_price:.2f}, 손절가: {stop_loss:.2f}")
+        # 기존 포지션
+        old_position = self.position
+        
+        # RL이 결정한 대로 포지션 조절 (position_size를 목표 포지션으로 직접 설정)
+        # 주식은 숏 포지션이 없으므로 position_size만으로 충분
+        # position_size: 0.0 (청산) ~ 1.0 (최대 롱)
+        new_position = min(size, 1.0)  # 목표 포지션 크기
+        
+        # 포지션 변경 처리 (부동소수점 오차 고려)
+        EPSILON = 1e-6  # 부동소수점 비교를 위한 작은 값
+        
+        # 실제 포지션 변화량 계산 (부동소수점 오차 고려)
+        position_change = abs(new_position - old_position)
+        
+        # 의미있는 변화가 없으면 무시 (부동소수점 오차로 인한 미세한 변화 방지)
+        if position_change < EPSILON:
+            return
+        
+        if abs(new_position) < EPSILON and old_position > EPSILON:
+            # 전체 청산
+            self._close_position(current_price, idx, timestamp, reason='RL 포지션 조절 (전체 청산)')
+        elif (old_position - new_position) > EPSILON and old_position > EPSILON:
+            # 일부 청산 (포지션 감소) - 거래로 기록
+            # 실제 청산 비중 계산
+            closed_size = old_position - new_position
+            # 손익 계산: (가격변화율) * (청산비중) * (현재자본)
+            # closed_size는 비중 (0.01 = 1%), balance는 현재 자본
+            if self.entry_price > 0:
+                pnl = (current_price - self.entry_price) / self.entry_price * closed_size * self.balance
+            else:
+                pnl = 0.0
             
-            elif action == 'SELL' and size > 0:
-                # 매도 (숏)
-                self.position = -min(size, 1.0)
+            # 거래 비용 차감 (RL 학습 환경과 동일한 방식)
+            transaction_cost_rate = self.config.get('backtest', {}).get('transaction_cost_rate', 0.001)
+            transaction_cost = closed_size * self.balance * transaction_cost_rate
+            pnl -= transaction_cost
+            
+            self.balance += pnl
+            
+            # 일부 청산 거래 기록
+            # 비중 감소 = SELL 신호이므로 entry_action을 'SELL'로 설정
+            self._update_entry_meta(signal, 'SELL', current_price)
+            trade_record = {
+                'timestamp': timestamp,
+                'action': 'PARTIAL_CLOSE',
+                'entry_price': self.entry_price,
+                'exit_price': current_price,
+                'position_size': closed_size,
+                'pnl': pnl,
+                'transaction_cost': transaction_cost,  # 거래 비용 기록
+                'reason': f'일부 청산 ({old_position:.2f} → {new_position:.2f})',
+                # 진입 시점 메타데이터 포함 (비중 감소 = SELL)
+                'entry_action': 'SELL',
+                'xgb_buy_prob_entry': self.entry_meta.get('xgb_buy_prob_entry', 0.0),
+                'xgb_sell_prob_entry': self.entry_meta.get('xgb_sell_prob_entry', 0.0),
+                'xgb_hold_prob_entry': self.entry_meta.get('xgb_hold_prob_entry', 0.0),
+                'xgb_action_entry': self.entry_meta.get('xgb_action_entry', 'HOLD'),
+                'lstm_target_entry': self.entry_meta.get('lstm_target_entry', current_price * 1.02),
+                'lstm_stop_entry': self.entry_meta.get('lstm_stop_entry', current_price * 0.98),
+                'rl_position_size': self.entry_meta.get('rl_position_size', 0.0)
+            }
+            self.trade_history.append(trade_record)
+            
+            self.position = new_position
+            print(f"[샘플] RL 일부 청산: {timestamp}, 가격: {current_price:.2f}, 비중: {old_position:.2f} → {new_position:.2f}, 청산비중: {closed_size:.4f}, 손익: {pnl:.2f}")
+        elif (new_position - old_position) > EPSILON:
+            # 추가 매수 또는 새로 진입 - 거래로 기록
+            # 비중 증가 = BUY 신호이므로 entry_action을 'BUY'로 설정
+            self._update_entry_meta(signal, 'BUY', current_price)
+            
+            if old_position < EPSILON:
+                # 새로 진입
                 self.entry_price = current_price
                 self.entry_timestamp = timestamp
-                self.target_price = target_price
-                self.stop_loss = stop_loss
-                # 진입 메타 저장 (분석용)
-                xgb_sig = signal.get('reasoning', {}).get('direction_signal', {})
-                rl_dec = signal.get('reasoning', {}).get('rl_decision', {})
-                xgb_buy = float(xgb_sig.get('buy_prob', 0.0))
-                xgb_sell = float(xgb_sig.get('sell_prob', 0.0))
-                xgb_hold = float(xgb_sig.get('hold_prob', 0.0))
-                xgb_action = 'BUY' if xgb_buy > max(xgb_sell, xgb_hold) else ('SELL' if xgb_sell > max(xgb_buy, xgb_hold) else 'HOLD')
-                self.entry_meta = {
-                    'entry_action': 'SELL',
-                    'xgb_buy_prob_entry': xgb_buy,
-                    'xgb_sell_prob_entry': xgb_sell,
-                    'xgb_hold_prob_entry': xgb_hold,
-                    'xgb_action_entry': xgb_action,
-                    'lstm_target_entry': float(target_price),
-                    'lstm_stop_entry': float(stop_loss),
-                    'rl_action_entry': int(rl_dec.get('action_type', 0)),
+                
+                # 거래 비용 차감 (RL 학습 환경과 동일한 방식)
+                transaction_cost_rate = self.config.get('backtest', {}).get('transaction_cost_rate', 0.001)
+                transaction_cost = new_position * self.balance * transaction_cost_rate
+                self.balance -= transaction_cost
+            else:
+                # 추가 매수 (평균 진입가 조정) - 거래로 기록
+                additional_size = new_position - old_position
+                
+                # 거래 비용 차감 (RL 학습 환경과 동일한 방식)
+                transaction_cost_rate = self.config.get('backtest', {}).get('transaction_cost_rate', 0.001)
+                transaction_cost = additional_size * self.balance * transaction_cost_rate
+                self.balance -= transaction_cost
+                
+                trade_record = {
+                    'timestamp': timestamp,
+                    'action': 'ADD_BUY',
+                    'entry_price': current_price,
+                    'exit_price': current_price,
+                    'position_size': additional_size,
+                    'pnl': 0.0,  # 추가 매수는 즉시 손익 없음
+                    'transaction_cost': transaction_cost,  # 거래 비용 기록
+                    'reason': f'추가 매수 ({old_position:.2f} → {new_position:.2f})',
+                    # 진입 시점 메타데이터 포함 (비중 증가 = BUY)
+                    'entry_action': 'BUY',
+                    'xgb_buy_prob_entry': self.entry_meta.get('xgb_buy_prob_entry', 0.0),
+                    'xgb_sell_prob_entry': self.entry_meta.get('xgb_sell_prob_entry', 0.0),
+                    'xgb_hold_prob_entry': self.entry_meta.get('xgb_hold_prob_entry', 0.0),
+                    'xgb_action_entry': self.entry_meta.get('xgb_action_entry', 'HOLD'),
+                    'lstm_target_entry': self.entry_meta.get('lstm_target_entry', current_price * 1.02),
+                    'lstm_stop_entry': self.entry_meta.get('lstm_stop_entry', current_price * 0.98),
+                    'rl_position_size': self.entry_meta.get('rl_position_size', 0.0)
                 }
-                print(f"[샘플] 매도 신호: {timestamp}, 가격: {current_price:.2f}, 크기: {abs(self.position):.2f}, "
-                      f"목표가: {target_price:.2f}, 손절가: {stop_loss:.2f}")
+                self.trade_history.append(trade_record)
+                
+                # 평균 진입가 조정
+                total_value = self.entry_price * old_position + current_price * additional_size
+                self.entry_price = total_value / new_position if new_position > EPSILON else current_price
+            
+            self.position = new_position
+            print(f"[샘플] RL 매수: {timestamp}, 가격: {current_price:.2f}, 비중: {old_position:.2f} → {new_position:.2f}")
+        # abs(new_position - old_position) <= EPSILON이면 변경 없음 (로그 출력 안 함)
+    
+    def _update_entry_meta(self, signal: Dict, action: str, current_price: float):
+        """진입 메타데이터 업데이트"""
+        xgb_sig = signal.get('reasoning', {}).get('direction_signal', {})
+        rl_dec = signal.get('reasoning', {}).get('rl_decision', {})
+        price_pred = signal.get('reasoning', {}).get('price_prediction', {})
+        xgb_buy = float(xgb_sig.get('buy_prob', 0.0))
+        xgb_sell = float(xgb_sig.get('sell_prob', 0.0))
+        xgb_hold = float(xgb_sig.get('hold_prob', 0.0))
+        xgb_action = 'BUY' if xgb_buy > max(xgb_sell, xgb_hold) else ('SELL' if xgb_sell > max(xgb_buy, xgb_hold) else 'HOLD')
+        # LSTM 목표가/손절가는 분석용으로만 저장 (RL의 학습 자료)
+        lstm_target = price_pred.get('target_price', current_price * 1.02)
+        lstm_stop = price_pred.get('stop_loss', current_price * 0.98)
+        self.entry_meta = {
+            'entry_action': action,
+            'xgb_buy_prob_entry': xgb_buy,
+            'xgb_sell_prob_entry': xgb_sell,
+            'xgb_hold_prob_entry': xgb_hold,
+            'xgb_action_entry': xgb_action,
+            'lstm_target_entry': float(lstm_target),  # 분석용 (RL의 학습 자료)
+            'lstm_stop_entry': float(lstm_stop),  # 분석용 (RL의 학습 자료)
+            'rl_position_size': float(rl_dec.get('position_size', 0.0)),
+        }
     
     def _close_position(self, exit_price: float, idx: int, timestamp, reason: str = '청산'):
         """포지션 청산"""
@@ -290,9 +371,9 @@ class Backtester:
             'xgb_sell_prob_entry': self.entry_meta.get('xgb_sell_prob_entry', 0.0),
             'xgb_hold_prob_entry': self.entry_meta.get('xgb_hold_prob_entry', 0.0),
             'xgb_action_entry': self.entry_meta.get('xgb_action_entry', 'HOLD'),
-            'lstm_target_entry': self.entry_meta.get('lstm_target_entry', self.target_price),
-            'lstm_stop_entry': self.entry_meta.get('lstm_stop_entry', self.stop_loss),
-            'rl_action_entry': self.entry_meta.get('rl_action_entry', 0),
+            'lstm_target_entry': self.entry_meta.get('lstm_target_entry', 0.0),  # 분석용 (RL의 학습 자료)
+            'lstm_stop_entry': self.entry_meta.get('lstm_stop_entry', 0.0),  # 분석용 (RL의 학습 자료)
+            'rl_position_size': self.entry_meta.get('rl_position_size', 0.0),
         }
         self.trade_history.append(trade_record)
         
@@ -302,8 +383,7 @@ class Backtester:
         self.position = 0.0
         self.entry_price = 0.0
         self.entry_timestamp = None
-        self.target_price = 0.0
-        self.stop_loss = 0.0
+        # 익절/손절 제거: RL의 포지션 관리(비중)로만 리스크 관리
         self.entry_meta = {}
     
     def _analyze_results(self) -> Dict:
@@ -333,20 +413,32 @@ class Backtester:
         df = pd.DataFrame(self.trade_history)
         
         # 기본 통계
-        total_trades = len(df)
-        profitable_trades = len(df[df['pnl'] > 0])
+        # 승률 계산: 부분 청산(PARTIAL_CLOSE) + 전체 청산(LONG_CLOSE) 모두 포함
+        # 청산 시 수익이면 승리, 손실이면 패배
+        close_trades = df[df['action'].isin(['PARTIAL_CLOSE', 'LONG_CLOSE'])]
+        # pnl이 0이 아닌 거래만 포함 (실제 손익이 발생한 거래)
+        close_trades_with_pnl = close_trades[close_trades['pnl'] != 0.0]
+        total_trades = len(close_trades_with_pnl)
+        profitable_trades = len(close_trades_with_pnl[close_trades_with_pnl['pnl'] > 0])
         win_rate = profitable_trades / total_trades if total_trades > 0 else 0
         
-        total_pnl = df['pnl'].sum()
+        # 전체 손익 통계 (PARTIAL_CLOSE + LONG_CLOSE 포함)
+        trades_with_pnl = df[df['pnl'] != 0.0]  # 손익이 있는 모든 거래
+        
+        # 전체 거래 수 (분석용)
+        total_all_trades = len(df)
+        
+        # 손익이 있는 거래만으로 통계 계산
+        total_pnl = trades_with_pnl['pnl'].sum() if len(trades_with_pnl) > 0 else 0.0
         final_balance = self.balance
         total_return = (final_balance - self.initial_balance) / self.initial_balance
         
-        avg_pnl = df['pnl'].mean()
-        max_profit = df['pnl'].max()
-        max_loss = df['pnl'].min()
+        avg_pnl = trades_with_pnl['pnl'].mean() if len(trades_with_pnl) > 0 else 0.0
+        max_profit = trades_with_pnl['pnl'].max() if len(trades_with_pnl) > 0 else 0.0
+        max_loss = trades_with_pnl['pnl'].min() if len(trades_with_pnl) > 0 else 0.0
         
-        # Sharpe Ratio
-        returns = df['pnl'].values
+        # Sharpe Ratio (손익이 있는 거래만)
+        returns = trades_with_pnl['pnl'].values if len(trades_with_pnl) > 0 else np.array([])
         sharpe_ratio = 0.0
         if len(returns) > 1 and returns.std() > 0:
             sharpe_ratio = returns.mean() / returns.std() * np.sqrt(252)  # 연율화
@@ -362,9 +454,10 @@ class Backtester:
             'initial_balance': self.initial_balance,
             'final_balance': final_balance,
             'total_return': total_return,
-            'total_trades': total_trades,
-            'profitable_trades': profitable_trades,
-            'win_rate': win_rate,
+            'total_trades': total_trades,  # 청산 거래 수 (PARTIAL_CLOSE + LONG_CLOSE, pnl != 0)
+            'total_all_trades': len(trades_with_pnl),  # 전체 거래 수 (모든 거래, pnl != 0)
+            'profitable_trades': profitable_trades,  # 청산 승리 거래 수 (PARTIAL_CLOSE + LONG_CLOSE, pnl > 0)
+            'win_rate': win_rate,  # 청산 승률 (PARTIAL_CLOSE + LONG_CLOSE)
             'total_pnl': total_pnl,
             'avg_pnl': avg_pnl,
             'max_profit': max_profit,
@@ -375,89 +468,10 @@ class Backtester:
             'trade_history': df
         }
         
-        # 모델별 기여도 분석
-        model_analysis = self._analyze_model_contributions(df)
-        
-        # 결과에 모델 분석 추가
-        results['model_analysis'] = model_analysis
+        # 모델별 기여도 분석 제거: 최종 결정은 RL Agent가 내리므로 개별 모델 분석은 의미 없음
+        # XGBoost와 LSTM은 RL Agent의 입력 정보로만 사용되며, 최종 포지션 크기 결정은 RL Agent가 수행
         
         return results
-    
-    def _analyze_model_contributions(self, trade_df: pd.DataFrame) -> Dict:
-        """모델별 기여도 분석"""
-        if len(trade_df) == 0:
-            return {
-                'xgb_buy_accuracy': 0.0,
-                'xgb_sell_accuracy': 0.0,
-                'xgb_avg_signal_strength': 0.0,
-                'lstm_take_profit_ratio': 0.0,
-                'lstm_stop_loss_ratio': 0.0,
-                'lstm_target_achievement': 0.0,
-                'lstm_stop_achievement': 0.0,
-                'rl_active_ratio': 0.0,
-                'rl_xgb_agreement': 0.0
-            }
-        # XGBoost 분석: 진입 시점 기록 기반
-        xgb_buy_trades = trade_df[trade_df['xgb_action_entry'] == 'BUY']
-        xgb_sell_trades = trade_df[trade_df['xgb_action_entry'] == 'SELL']
-        xgb_buy_accuracy = (xgb_buy_trades['pnl'] > 0).mean() if len(xgb_buy_trades) > 0 else 0.0
-        xgb_sell_accuracy = (xgb_sell_trades['pnl'] > 0).mean() if len(xgb_sell_trades) > 0 else 0.0
-        xgb_avg_signal_strength = np.maximum(
-            trade_df.get('xgb_buy_prob_entry', 0.0),
-            trade_df.get('xgb_sell_prob_entry', 0.0)
-        ).mean() if len(trade_df) > 0 else 0.0
-        
-        # LSTM 분석: 목표가/손절가 효과
-        # 목표가/손절가 달성률 계산 (진입 시점의 LSTM 목표/손절 기준)
-        profitable_trades = trade_df[trade_df['pnl'] > 0]
-        loss_trades = trade_df[trade_df['pnl'] < 0]
-        lstm_take_profit_ratio = len(profitable_trades[profitable_trades['reason'] == '익절']) / len(trade_df) if len(trade_df) > 0 else 0.0
-        lstm_stop_loss_ratio = len(loss_trades[loss_trades['reason'] == '손절']) / len(trade_df) if len(trade_df) > 0 else 0.0
-        target_achievements = []
-        stop_achievements = []
-        for _, trade in trade_df.iterrows():
-            target_entry = float(trade.get('lstm_target_entry', np.nan))
-            stop_entry = float(trade.get('lstm_stop_entry', np.nan))
-            if np.isnan(target_entry) or np.isnan(stop_entry):
-                continue
-            if trade['action'] == 'LONG_CLOSE':
-                target_achieved = trade['exit_price'] >= target_entry
-                stop_achieved = trade['exit_price'] <= stop_entry
-            else:
-                target_achieved = trade['exit_price'] <= target_entry
-                stop_achieved = trade['exit_price'] >= stop_entry
-            target_achievements.append(1.0 if target_achieved else 0.0)
-            stop_achievements.append(1.0 if stop_achieved else 0.0)
-        
-        lstm_target_achievement = np.mean(target_achievements) if len(target_achievements) > 0 else 0.0
-        lstm_stop_achievement = np.mean(stop_achievements) if len(stop_achievements) > 0 else 0.0
-        
-        # RL Agent 분석 (진입 시점 기준)
-        rl_active_ratio = (trade_df['rl_action_entry'] != 0).mean() if 'rl_action_entry' in trade_df.columns else 0.0
-        # XGBoost와의 일치율: RL BUY=1, SELL=2 → XGB 'BUY'/'SELL' 매핑
-        rl_xgb_agreements = []
-        for _, trade in trade_df.iterrows():
-            rl_act = int(trade.get('rl_action_entry', 0))
-            xgb_act = trade.get('xgb_action_entry', 'HOLD')
-            if rl_act == 0:
-                continue
-            if (rl_act == 1 and xgb_act == 'BUY') or (rl_act == 2 and xgb_act == 'SELL'):
-                rl_xgb_agreements.append(1.0)
-            else:
-                rl_xgb_agreements.append(0.0)
-        rl_xgb_agreement = float(np.mean(rl_xgb_agreements)) if len(rl_xgb_agreements) > 0 else 0.0
-        
-        return {
-            'xgb_buy_accuracy': xgb_buy_accuracy,
-            'xgb_sell_accuracy': xgb_sell_accuracy,
-            'xgb_avg_signal_strength': xgb_avg_signal_strength,
-            'lstm_take_profit_ratio': lstm_take_profit_ratio,
-            'lstm_stop_loss_ratio': lstm_stop_loss_ratio,
-            'lstm_target_achievement': lstm_target_achievement,
-            'lstm_stop_achievement': lstm_stop_achievement,
-            'rl_active_ratio': rl_active_ratio,
-            'rl_xgb_agreement': rl_xgb_agreement
-        }
 
     def _save_portfolio_cover_chart(self, price_series: pd.Series, results: Dict):
         """최종 트레이딩 결과를 차트로 시각화하여 저장 (포트폴리오 표지용)"""
@@ -545,13 +559,7 @@ class Backtester:
         max_dd_pct = results.get('max_drawdown_pct', 0.0)
 
         # 모델 분석
-        model_analysis = results.get('model_analysis', {})
-        xgb_buy_acc = model_analysis.get('xgb_buy_accuracy', 0.0)
-        xgb_sell_acc = model_analysis.get('xgb_sell_accuracy', 0.0)
-        xgb_avg_strength = model_analysis.get('xgb_avg_signal_strength', 0.0)
-        lstm_tp_ratio = model_analysis.get('lstm_take_profit_ratio', 0.0)
-        lstm_sl_ratio = model_analysis.get('lstm_stop_loss_ratio', 0.0)
-        rl_agree = model_analysis.get('rl_xgb_agreement', 0.0)
+        # 모델별 기여도 분석 제거: 최종 결정은 RL Agent가 내리므로 개별 모델 분석은 의미 없음
 
         # 하단 정보 박스 (요구 항목만 표기: 총 수익률, 승률, Sharpe, 최대 낙폭)
         footer_ax = fig.add_axes([0.03, 0.03, 0.94, 0.14])

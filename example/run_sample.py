@@ -21,6 +21,7 @@ from config.config_loader import load_config, get_data_config
 from data.download_data import download_stock_data, save_data
 from ai_learning.train_sample import main as train_main
 import pandas as pd
+from datetime import datetime
 
 def main():
     """샘플 프로젝트 메인 실행"""
@@ -42,25 +43,42 @@ def main():
     min_data_days = data_config.get('min_data_days', 730)
     
     data_path = os.path.join(example_dir, output_dir, output_file)
+    
+    # 오늘 날짜 확인
+    today = datetime.now().date()
+    
+    # 데이터 파일이 있는지 확인하고, 최신 데이터인지 확인
+    need_download = False
     if not os.path.exists(data_path):
         print(f"\n[샘플] 1단계: {symbol} 데이터 다운로드")
+        need_download = True
+    else:
+        print(f"\n[샘플] 1단계: 기존 {symbol} 데이터 확인 중...")
+        # 기존 데이터 로드하여 마지막 날짜 확인
+        existing_data = pd.read_csv(data_path, index_col=0, parse_dates=True)
+        last_date = existing_data.index[-1].date()
+        data_days = (existing_data.index[-1] - existing_data.index[0]).days
+        
+        # 마지막 날짜가 오늘보다 오래되었거나, 데이터 기간이 부족하면 다운로드
+        if last_date < today:
+            print(f"[샘플] 기존 데이터의 마지막 날짜: {last_date}")
+            print(f"[샘플] 오늘 날짜: {today}")
+            print(f"[샘플] 최신 데이터를 다운로드합니다...")
+            need_download = True
+        elif data_days < min_data_days:
+            print(f"[샘플] 기존 데이터가 {data_days}일로 부족합니다. 더 긴 기간의 데이터를 다운로드합니다.")
+            need_download = True
+        else:
+            print(f"[샘플] 기존 데이터 사용 (마지막 날짜: {last_date})")
+            data = existing_data
+    
+    if need_download:
         os.makedirs(os.path.dirname(data_path), exist_ok=True)
         data = download_stock_data(symbol, start_date, end_date)
         save_data(data, data_path)
         print(f"[샘플] 데이터 다운로드 완료: {len(data)}개 데이터 포인트")
-    else:
-        print(f"\n[샘플] 1단계: 기존 {symbol} 데이터 사용")
-        data = pd.read_csv(data_path, index_col=0, parse_dates=True)
-        print(f"[샘플] 데이터 로드 완료: {len(data)}개 데이터 포인트")
-        print(f"[샘플] 데이터 기간: {data.index[0].date()} ~ {data.index[-1].date()}")
-        
-        # 데이터가 최소 기간 미만이면 다시 다운로드
-        data_days = (data.index[-1] - data.index[0]).days
-        if data_days < min_data_days:
-            print(f"[샘플] 기존 데이터가 {data_days}일로 부족합니다. 더 긴 기간의 데이터를 다운로드합니다.")
-            data = download_stock_data(symbol, start_date, end_date)
-            save_data(data, data_path)
-            print(f"[샘플] 데이터 다운로드 완료: {len(data)}개 데이터 포인트")
+    
+    print(f"[샘플] 데이터 기간: {data.index[0].date()} ~ {data.index[-1].date()}")
     
     # 2. AI Learning Module 학습 및 백테스트
     print("\n[샘플] 2단계: AI Learning Module 학습 및 백테스트")
@@ -87,25 +105,8 @@ def main():
             print(f"최대 낙폭: {backtest_results.get('max_drawdown', 0):,.0f} ({backtest_results.get('max_drawdown_pct', 0):.2%})")
             print("=" * 60)
             
-            # 모델별 기여도 분석
-            model_analysis = backtest_results.get('model_analysis')
-            if model_analysis:
-                print("\n" + "=" * 60)
-                print("[샘플] 모델별 기여도 분석")
-                print("=" * 60)
-                print(f"XGBoost 매매 분류 효과:")
-                print(f"  - BUY 신호 정확도: {model_analysis.get('xgb_buy_accuracy', 0):.2%}")
-                print(f"  - SELL 신호 정확도: {model_analysis.get('xgb_sell_accuracy', 0):.2%}")
-                print(f"  - 평균 신호 강도: {model_analysis.get('xgb_avg_signal_strength', 0):.3f}")
-                print(f"\nLSTM 목표가/손절가 효과:")
-                print(f"  - 익절 비율: {model_analysis.get('lstm_take_profit_ratio', 0):.2%}")
-                print(f"  - 손절 비율: {model_analysis.get('lstm_stop_loss_ratio', 0):.2%}")
-                print(f"  - 평균 목표가 달성률: {model_analysis.get('lstm_target_achievement', 0):.2%}")
-                print(f"  - 평균 손절가 달성률: {model_analysis.get('lstm_stop_achievement', 0):.2%}")
-                print(f"\nRL Agent 효과:")
-                print(f"  - RL Agent가 BUY/SELL을 반환한 비율: {model_analysis.get('rl_active_ratio', 0):.2%}")
-                print(f"  - RL Agent와 XGBoost 일치율: {model_analysis.get('rl_xgb_agreement', 0):.2%}")
-                print("=" * 60)
+            # 모델별 기여도 분석 제거: 최종 결정은 RL Agent가 내리므로 개별 모델 분석은 의미 없음
+            # XGBoost와 LSTM은 RL Agent의 입력 정보로만 사용되며, 최종 포지션 크기 결정은 RL Agent가 수행
             
             # 거래 히스토리 요약
             trade_history = backtest_results.get('trade_history')

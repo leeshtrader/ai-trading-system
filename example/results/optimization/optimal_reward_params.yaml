@@ -1,0 +1,28 @@
+best_sharpe_ratio: 15.631501143214583
+optimal_parameters:
+  avoidance_bonus: 19.076556638811464
+  correct_direction_bonus: 86.3884286106082
+  loss_expansion_penalty_scale: 94.59825103901319
+  lstm_position_bonus: 8.429376615192915
+  lstm_position_bonus_scale: 6.865700588860358
+  lstm_position_penalty_scale: 4.214688307596457
+  opportunity_cost_penalty: 24.034377035054824
+  position_diversity_bonus: 2.376566639666546
+  position_risk_penalty_scale: 29.674618929475123
+  profit_taking_bonus_scale: 145.7300505387719
+  reward_scale: 128.57734915883145
+  signal_match_bonus: 11.752576582672852
+  wrong_direction_penalty: 44.029527777569584
+raw_optuna_params:
+  avoidance_ratio: 0.14836638617620135
+  correct_dir_ratio: 0.6718790609370292
+  diversity_ratio: 0.018483556047891266
+  loss_expansion_ratio: 0.7357302950938589
+  lstm_bonus_base: 8.429376615192915
+  lstm_bonus_scale: 6.865700588860358
+  opp_cost_ratio: 0.1869254358741304
+  profit_taking_ratio: 1.1334037565104236
+  reward_scale: 128.57734915883145
+  risk_penalty_ratio: 0.2307919639315172
+  signal_match_ratio: 0.09140471987919822
+  wrong_dir_ratio: 0.34243611386932515

@@ -65,13 +65,28 @@ role-based-trading-ai/
 │   ├── system_design.md              # 시스템 설계 및 인터페이스
 │   └── implementation_guide.md       # 구현 가이드
 └── example/                           # 샘플 프로젝트
-    ├── run_sample.py                  # 샘플 실행 스크립트
+    ├── run_sample.py                  # 샘플 실행 스크립트 (전체 파이프라인)
+    ├── inference.py                   # 추론 스크립트 (저장된 모델로 예측)
     ├── config/                        # 설정 파일
-    │   └── sample_config.yaml
+    │   ├── sample_config.yaml         # YAML 설정 파일
+    │   └── config_loader.py           # 설정 로더 유틸리티
     ├── data/                          # 데이터 저장소
     │   ├── download_data.py          # 데이터 다운로드 스크립트
     │   └── nvda_data.csv             # 샘플 데이터 (NVDA)
-    ├── results/                       # 결과 저장소 (이미지, 차트 등)
+    ├── models/                        # 학습된 모델 저장소
+    │   ├── xgboost_model.pkl         # XGBoost 모델
+    │   ├── lstm_model.pth             # LSTM 모델
+    │   └── rl_agent.zip               # 강화학습 Agent
+    ├── results/                       # 결과 저장소
+    │   ├── xgboost/                   # XGBoost 결과 (차트, 임계값 등)
+    │   ├── lstm/                      # LSTM 결과 (학습 곡선, 예측 비교 등)
+    │   ├── lstm_comparison/           # LSTM 모델 비교 결과
+    │   ├── rl/                        # 강화학습 결과 (보상, 행동 분포 등)
+    │   ├── diagnosis/                 # 데이터 진단 결과
+    │   └── optimization/              # 최적화 결과
+    ├── tools/                         # 최적화 및 분석 도구
+    │   ├── optimize_thresholds.py    # XGBoost 임계값 최적화
+    │   └── optimize_reward_params.py  # RL 보상 파라미터 최적화
     ├── feature_engineering/           # 피처 엔지니어링 모듈
     │   └── feature_engineering.py    # 기술적 지표 생성
     └── ai_learning/                   # AI 학습 모듈 샘플
@@ -82,7 +97,9 @@ role-based-trading-ai/
         ├── ensemble/                  # 앙상블
         │   └── role_based_ensemble.py
         ├── backtest.py                # 백테스트 모듈
-        └── train_sample.py            # 샘플 학습 스크립트
+        ├── train_sample.py            # 샘플 학습 스크립트 (전체 파이프라인)
+        ├── train_xgboost.py           # XGBoost 개별 학습 스크립트
+        └── train_lstm.py              # LSTM 개별 학습 스크립트
 ```
 
 ## 빠른 시작
@@ -117,12 +134,37 @@ pip install -r requirements.txt
 
 ### 샘플 프로젝트 실행
 
+#### 전체 파이프라인 실행
 ```bash
 cd example
 python run_sample.py
 ```
 
-샘플 프로젝트는 전체 파이프라인을 간단히 보여줍니다. NVDA 종목 데이터를 사용하여 XGBoost, LSTM, 강화학습 모델을 학습하고 백테스트를 수행합니다.
+전체 파이프라인을 실행합니다. NVDA 종목 데이터를 사용하여 XGBoost, LSTM, 강화학습 모델을 학습하고 백테스트를 수행합니다.
+
+#### 개별 모델 학습
+```bash
+# XGBoost만 학습
+python ai_learning/train_xgboost.py
+
+# LSTM만 학습
+python ai_learning/train_lstm.py
+```
+
+#### 추론 (저장된 모델 사용)
+```bash
+# 학습된 모델로 새로운 데이터 예측
+python inference.py
+```
+
+#### 최적화 도구 사용
+```bash
+# XGBoost 임계값 최적화
+python tools/optimize_thresholds.py
+
+# 강화학습 보상 파라미터 최적화
+python tools/optimize_reward_params.py
+```
 
 ## 주요 기능
 
@@ -132,6 +174,17 @@ python run_sample.py
 2. **LSTM 가격 예측 모델**: 시계열 데이터 기반 가격 목표 예측
 3. **강화학습 Agent**: 최종 행동 및 포지션 크기 결정
 4. **역할 분담 앙상블**: 각 모델의 예측을 통합하여 최종 신호 생성
+
+### 추론 및 최적화 도구
+
+1. **추론 스크립트 (`inference.py`)**: 저장된 모델을 로드하여 새로운 데이터에 대한 예측 수행
+2. **임계값 최적화 (`tools/optimize_thresholds.py`)**: XGBoost 예측 확률 분포 분석을 통한 최적 임계값 계산
+3. **보상 파라미터 최적화 (`tools/optimize_reward_params.py`)**: Optuna를 사용한 강화학습 보상 함수 파라미터 최적화 (Sharpe Ratio 기반)
+
+### 개별 모델 학습
+
+1. **XGBoost 개별 학습 (`train_xgboost.py`)**: XGBoost 모델만 별도로 학습하고 임계값 최적화 수행
+2. **LSTM 개별 학습 (`train_lstm.py`)**: LSTM 모델만 별도로 학습하고 성능 평가 수행
 
 
 ## 문서
@@ -147,9 +200,10 @@ python run_sample.py
 
 ## 기술 스택 요약
 
-- **AI/ML**: XGBoost, PyTorch, Stable-Baselines3, Gymnasium
+- **AI/ML**: XGBoost, PyTorch, Stable-Baselines3, Gymnasium, Optuna
 - **데이터 처리**: Pandas, NumPy, Scikit-learn
 - **데이터 수집**: yfinance (Yahoo Finance)
+- **설정 관리**: PyYAML (YAML 설정 파일)
 - **시각화**: Matplotlib
 - **언어**: Python 3.8+
 
@@ -268,13 +322,28 @@ role-based-trading-ai/
 │   ├── system_design.md              # System design and interfaces
 │   └── implementation_guide.md       # Implementation guide
 └── example/                           # Sample project
-    ├── run_sample.py                  # Sample execution script
+    ├── run_sample.py                  # Sample execution script (full pipeline)
+    ├── inference.py                   # Inference script (prediction with saved models)
     ├── config/                        # Configuration files
-    │   └── sample_config.yaml
+    │   ├── sample_config.yaml         # YAML configuration file
+    │   └── config_loader.py           # Configuration loader utility
     ├── data/                          # Data storage
     │   ├── download_data.py          # Data download script
     │   └── nvda_data.csv             # Sample data (NVDA)
-    ├── results/                       # Results storage (images, charts, etc.)
+    ├── models/                        # Trained models storage
+    │   ├── xgboost_model.pkl         # XGBoost model
+    │   ├── lstm_model.pth             # LSTM model
+    │   └── rl_agent.zip               # Reinforcement Learning Agent
+    ├── results/                       # Results storage
+    │   ├── xgboost/                   # XGBoost results (charts, thresholds, etc.)
+    │   ├── lstm/                      # LSTM results (learning curves, predictions, etc.)
+    │   ├── lstm_comparison/           # LSTM model comparison results
+    │   ├── rl/                        # RL results (rewards, action distributions, etc.)
+    │   ├── diagnosis/                 # Data diagnosis results
+    │   └── optimization/              # Optimization results
+    ├── tools/                         # Optimization and analysis tools
+    │   ├── optimize_thresholds.py    # XGBoost threshold optimization
+    │   └── optimize_reward_params.py  # RL reward parameter optimization
     ├── feature_engineering/           # Feature engineering module
     │   └── feature_engineering.py    # Technical indicator generation
     └── ai_learning/                   # AI learning module sample
@@ -285,7 +354,9 @@ role-based-trading-ai/
         ├── ensemble/                  # Ensemble
         │   └── role_based_ensemble.py
         ├── backtest.py                # Backtesting module
-        └── train_sample.py            # Sample training script
+        ├── train_sample.py            # Sample training script (full pipeline)
+        ├── train_xgboost.py           # Individual XGBoost training script
+        └── train_lstm.py              # Individual LSTM training script
 ```
 
 ## Quick Start
@@ -320,12 +391,37 @@ pip install -r requirements.txt
 
 ### Run Sample Project
 
+#### Full Pipeline Execution
 ```bash
 cd example
 python run_sample.py
 ```
 
-The sample project demonstrates the complete pipeline. It uses NVDA stock data to train XGBoost, LSTM, and Reinforcement Learning models and perform backtesting.
+Runs the complete pipeline. Uses NVDA stock data to train XGBoost, LSTM, and Reinforcement Learning models and perform backtesting.
+
+#### Individual Model Training
+```bash
+# Train XGBoost only
+python ai_learning/train_xgboost.py
+
+# Train LSTM only
+python ai_learning/train_lstm.py
+```
+
+#### Inference (Using Saved Models)
+```bash
+# Predict with trained models on new data
+python inference.py
+```
+
+#### Optimization Tools
+```bash
+# Optimize XGBoost thresholds
+python tools/optimize_thresholds.py
+
+# Optimize RL reward parameters
+python tools/optimize_reward_params.py
+```
 
 ## Key Features
 
@@ -335,6 +431,17 @@ The sample project demonstrates the complete pipeline. It uses NVDA stock data t
 2. **LSTM Price Prediction Model**: Price target prediction based on time series data
 3. **Reinforcement Learning Agent**: Final action and position size decisions
 4. **Role-Based Ensemble**: Integrates predictions from each model to generate final signals
+
+### Inference and Optimization Tools
+
+1. **Inference Script (`inference.py`)**: Loads saved models and performs predictions on new data
+2. **Threshold Optimization (`tools/optimize_thresholds.py`)**: Calculates optimal thresholds by analyzing XGBoost prediction probability distributions
+3. **Reward Parameter Optimization (`tools/optimize_reward_params.py`)**: Optimizes reinforcement learning reward function parameters using Optuna (Sharpe Ratio based)
+
+### Individual Model Training
+
+1. **Individual XGBoost Training (`train_xgboost.py`)**: Trains XGBoost model separately and performs threshold optimization
+2. **Individual LSTM Training (`train_lstm.py`)**: Trains LSTM model separately and performs performance evaluation
 
 ## Documentation
 
@@ -349,9 +456,10 @@ The sample project demonstrates the complete pipeline. It uses NVDA stock data t
 
 ## Technology Stack Summary
 
-- **AI/ML**: XGBoost, PyTorch, Stable-Baselines3, Gymnasium
+- **AI/ML**: XGBoost, PyTorch, Stable-Baselines3, Gymnasium, Optuna
 - **Data Processing**: Pandas, NumPy, Scikit-learn
 - **Data Collection**: yfinance (Yahoo Finance)
+- **Configuration Management**: PyYAML (YAML configuration files)
 - **Visualization**: Matplotlib
 - **Language**: Python 3.8+
 

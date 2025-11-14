@@ -13,7 +13,7 @@
 - **XGBoost**: 구조화된 데이터 기반 방향 예측 (GPU 자동 감지 지원)
 - **PyTorch**: LSTM 구현 및 강화학습 (GPU 자동 감지 지원)
 - **Stable-Baselines3**: 강화학습 (PPO, GPU 자동 감지 지원)
-- **Optuna**: 하이퍼파라미터 최적화
+- **Optuna**: 하이퍼파라미터 최적화 (보상 파라미터 최적화에 사용)
 
 ### 데이터 처리
 
@@ -21,11 +21,16 @@
 - **Scikit-learn**: 전처리 및 평가
 - **Statsmodels**: 시계열 분석
 
-### 모니터링 및 관리
+### 설정 관리
 
-- **MLflow**: 모델 버전 관리 및 실험 추적
-- **Prometheus**: 시스템 메트릭 수집
-- **Grafana**: 실시간 대시보드
+- **PyYAML**: YAML 설정 파일 파싱 및 관리
+- **config_loader.py**: 설정 파일 로드 및 접근 유틸리티
+
+### 모니터링 및 관리 (향후 확장)
+
+- **MLflow**: 모델 버전 관리 및 실험 추적 (향후 구현)
+- **Prometheus**: 시스템 메트릭 수집 (향후 구현)
+- **Grafana**: 실시간 대시보드 (향후 구현)
 
 ### 데이터 저장
 
@@ -53,30 +58,50 @@ GPU가 없는 경우 자동으로 CPU로 전환되므로 별도 설정이 필요
 ```
 role-based-trading-ai/
 ├── example/
-│   ├── ai_learning/
-│   │   ├── models/
-│   │   │   ├── xgboost_direction.py
-│   │   │   ├── lstm_price.py
-│   │   │   └── rl_agent.py
-│   │   ├── ensemble/
-│   │   │   └── role_based_ensemble.py
-│   │   ├── backtest.py
-│   │   └── train_sample.py
+│   ├── run_sample.py                  # 전체 파이프라인 실행
+│   ├── inference.py                   # 추론 스크립트
+│   ├── config/
+│   │   ├── sample_config.yaml         # YAML 설정 파일
+│   │   └── config_loader.py           # 설정 로더 유틸리티
+│   ├── data/
+│   │   ├── download_data.py          # 데이터 다운로드
+│   │   └── nvda_data.csv             # 샘플 데이터
+│   ├── models/                        # 학습된 모델 저장소
+│   │   ├── xgboost_model.pkl
+│   │   ├── lstm_model.pth
+│   │   └── rl_agent.zip
+│   ├── results/                       # 결과 저장소
+│   │   ├── xgboost/                   # XGBoost 결과
+│   │   ├── lstm/                      # LSTM 결과
+│   │   ├── lstm_comparison/           # LSTM 비교 결과
+│   │   ├── rl/                        # 강화학습 결과
+│   │   ├── diagnosis/                 # 데이터 진단
+│   │   └── optimization/             # 최적화 결과
+│   ├── tools/                         # 최적화 도구
+│   │   ├── optimize_thresholds.py    # 임계값 최적화
+│   │   └── optimize_reward_params.py  # 보상 파라미터 최적화
 │   ├── feature_engineering/
 │   │   └── feature_engineering.py
-│   ├── data/
-│   │   └── download_data.py
-│   ├── config/
-│   │   └── sample_config.yaml
-│   └── run_sample.py
+│   └── ai_learning/
+│       ├── models/
+│       │   ├── xgboost_direction.py
+│       │   ├── lstm_price.py
+│       │   └── rl_agent.py
+│       ├── ensemble/
+│       │   └── role_based_ensemble.py
+│       ├── backtest.py
+│       ├── train_sample.py            # 전체 파이프라인 학습
+│       ├── train_xgboost.py           # XGBoost 개별 학습
+│       └── train_lstm.py              # LSTM 개별 학습
 ├── docs/
 └── requirements.txt
 ```
 
 새 프로젝트를 시작하는 경우:
 ```bash
-mkdir -p example/{ai_learning,feature_engineering,data,config}
+mkdir -p example/{ai_learning,feature_engineering,data,config,tools,models,results}
 mkdir -p example/ai_learning/{models,ensemble}
+mkdir -p example/results/{xgboost,lstm,lstm_comparison,rl,diagnosis,optimization}
 ```
 
 #### 1.2 가상환경 설정
@@ -87,41 +112,55 @@ source venv/bin/activate  # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-#### 1.3 설정 파일 생성
+#### 1.3 설정 파일 생성 및 사용
 
+샘플 프로젝트에서는 `example/config/sample_config.yaml` 파일을 사용합니다.
+설정 파일은 `config_loader.py`를 통해 로드됩니다.
+
+```python
+# 설정 파일 사용 예시
+from config.config_loader import load_config, get_data_config, get_model_config
+
+# 설정 파일 로드
+config = load_config()
+
+# 특정 섹션 가져오기
+data_config = get_data_config(config)
+xgboost_config = get_model_config(config, 'xgboost')
+```
+
+설정 파일 구조 (sample_config.yaml 참고):
 ```yaml
-# config/system_config.yaml
-database:
-  host: localhost
-  port: 5432
-  name: trading_db
-  user: trading_user
-  password: ${DB_PASSWORD}
-
-redis:
-  host: localhost
-  port: 6379
+data:
+  symbol: "NVDA"
+  start_date: "auto"  # 자동 계산 (years_back 사용)
+  end_date: "auto"    # 오늘 날짜
+  years_back: 5
 
 models:
   xgboost:
-    n_estimators: 200
+    n_estimators: 100
     max_depth: 6
-    learning_rate: 0.1
+    learning_rate: 0.05
   
   lstm:
-    sequence_length: 60
-    lstm_units: 128
+    sequence_length: 20
+    lstm_units: 32
     dropout_rate: 0.2
   
   rl:
     algorithm: PPO
     learning_rate: 3e-4
+    total_timesteps: 100000
     gamma: 0.99
 
-risk_management:
-  max_position_size: 0.3
-  max_daily_loss: 0.05
-  stop_loss_percent: 0.02
+training:
+  train_test_split: 0.8
+  validation_split: 0.8
+
+backtest:
+  initial_balance: 100000
+  transaction_cost_rate: 0.001
 ```
 
 ### Phase 2: XGBoost 모델 구현
@@ -663,6 +702,87 @@ class TestXGBoostModel(unittest.TestCase):
 if __name__ == '__main__':
     unittest.main()
 ```
+
+## 추론 및 최적화 도구
+
+### 추론 스크립트 (inference.py)
+
+학습된 모델을 로드하여 새로운 데이터에 대한 예측을 수행합니다.
+
+```bash
+cd example
+python inference.py
+```
+
+주요 기능:
+- 저장된 모델 자동 로드 (XGBoost, LSTM, RL Agent)
+- 새로운 데이터 다운로드 및 전처리
+- 앙상블을 통한 최종 거래 신호 생성
+- 예측 결과 출력
+
+### 최적화 도구
+
+#### 1. XGBoost 임계값 최적화 (tools/optimize_thresholds.py)
+
+XGBoost 예측 확률 분포를 분석하여 최적의 buy_threshold, sell_threshold를 계산합니다.
+
+```bash
+cd example
+python tools/optimize_thresholds.py
+```
+
+기능:
+- Precision-Recall 곡선 분석
+- F1 Score 최적화
+- 최적 임계값 계산 및 저장
+- 확률 분포 시각화
+
+#### 2. 강화학습 보상 파라미터 최적화 (tools/optimize_reward_params.py)
+
+Optuna를 사용하여 강화학습 보상 함수 파라미터를 Sharpe Ratio 기반으로 최적화합니다.
+
+```bash
+cd example
+python tools/optimize_reward_params.py
+```
+
+기능:
+- Optuna 베이지안 최적화
+- Sharpe Ratio 목표 최적화
+- 최적 파라미터 YAML 파일 저장
+- 최적화 과정 시각화
+
+### 개별 모델 학습
+
+#### XGBoost 개별 학습 (train_xgboost.py)
+
+XGBoost 모델만 별도로 학습하고 임계값 최적화를 수행합니다.
+
+```bash
+cd example
+python ai_learning/train_xgboost.py
+```
+
+기능:
+- XGBoost 모델 학습
+- 자동 임계값 최적화
+- 학습 곡선 및 성능 지표 시각화
+- 모델 저장
+
+#### LSTM 개별 학습 (train_lstm.py)
+
+LSTM 모델만 별도로 학습하고 성능 평가를 수행합니다.
+
+```bash
+cd example
+python ai_learning/train_lstm.py
+```
+
+기능:
+- LSTM 모델 학습
+- 가격 예측 성능 평가
+- 학습 곡선 및 예측 비교 시각화
+- 모델 저장
 
 ## 배포 체크리스트
 

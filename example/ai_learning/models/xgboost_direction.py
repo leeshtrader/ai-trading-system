@@ -19,7 +19,39 @@ import os
 import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Agg')  # GUI 없이 사용
+from matplotlib import rcParams, font_manager
+import platform
 from sklearn.metrics import confusion_matrix, classification_report
+
+# 한글 폰트 설정
+def set_korean_font():
+    """한글 폰트 설정 함수"""
+    system = platform.system()
+    candidates = []
+    if system == 'Windows':
+        candidates = ['Malgun Gothic', '맑은 고딕', 'NanumGothic', 'DejaVu Sans']
+    elif system == 'Darwin':
+        candidates = ['AppleGothic', 'NanumGothic', 'DejaVu Sans']
+    else:
+        candidates = ['NanumGothic', 'DejaVu Sans']
+    
+    for name in candidates:
+        try:
+            # 폰트가 실제로 존재하는지 확인
+            font_list = [f.name for f in font_manager.fontManager.ttflist]
+            if name in font_list or any(name.lower() in f.lower() for f in font_list):
+                rcParams['font.family'] = name
+                rcParams['axes.unicode_minus'] = False
+                return name
+        except Exception:
+            continue
+    
+    # 마지막 대비
+    rcParams['font.family'] = 'DejaVu Sans'
+    rcParams['axes.unicode_minus'] = False
+    return 'DejaVu Sans'
+
+set_korean_font()
 
 class XGBoostDirectionModel:
     """
@@ -55,6 +87,8 @@ class XGBoostDirectionModel:
     
     def build_model(self):
         """모델 구조 생성"""
+        # tree_method 설정 (GPU 사용 시 'gpu_hist', CPU 사용 시 'hist')
+        tree_method = self.config.get('tree_method', 'hist')
         self.model = xgb.XGBClassifier(
             n_estimators=self.config.get('n_estimators', 100),
             max_depth=self.config.get('max_depth', 6),
@@ -68,9 +102,10 @@ class XGBoostDirectionModel:
             objective='multi:softprob',
             num_class=self.config.get('num_class', 3),  # BUY, SELL, HOLD
             random_state=self.config.get('random_state', 42),
-            eval_metric=self.config.get('eval_metric', 'mlogloss')
+            eval_metric=self.config.get('eval_metric', 'mlogloss'),
+            tree_method=tree_method
         )
-        print("[샘플] XGBoost 모델 구조 생성 완료")
+        print(f"[샘플] XGBoost 모델 구조 생성 완료 (tree_method: {tree_method})")
     
     def train(self, X: np.ndarray, y: np.ndarray, X_val: np.ndarray = None, y_val: np.ndarray = None):
         """
@@ -87,18 +122,36 @@ class XGBoostDirectionModel:
         
         print(f"[샘플] XGBoost 학습 시작: {len(X)}개 샘플")
         
-        # 클래스 불균형 처리: 클래스 가중치 계산
-        from sklearn.utils.class_weight import compute_sample_weight
-        sample_weights = compute_sample_weight('balanced', y)
+        # 클래스 불균형 처리: 클래스 가중치 계산 (개선)
+        from sklearn.utils.class_weight import compute_class_weight
+        import numpy as np
+        
+        # 클래스별 가중치 계산 (SELL 클래스에 더 높은 가중치)
+        classes = np.unique(y)
+        class_weights = compute_class_weight('balanced', classes=classes, y=y)
+        
+        # SELL 클래스(2)에 추가 가중치 부여 (성능이 낮으므로)
+        weight_dict = dict(zip(classes, class_weights))
+        if 2 in weight_dict:  # SELL 클래스
+            weight_dict[2] *= 1.5  # SELL 가중치 1.5배 증가
+        
+        # 샘플 가중치 생성
+        sample_weights = np.array([weight_dict[label] for label in y])
         
         # 검증 데이터가 있으면 사용
         if X_val is not None and y_val is not None:
             eval_set = [(X, y), (X_val, y_val)]
-            val_sample_weights = compute_sample_weight('balanced', y_val)
+            val_sample_weights = np.array([weight_dict[label] for label in y_val])
         else:
             eval_set = [(X, y)]
             val_sample_weights = None
         
+        # Early stopping 설정 (XGBoost 버전 호환성 문제로 인해 제거)
+        # 참고: XGBoost 버전에 따라 early_stopping_rounds와 callbacks 지원이 다름
+        # 안정성을 위해 early stopping은 비활성화
+        # 필요시 n_estimators를 적절히 설정하여 과적합 방지
+        
+        # fit 실행
         self.model.fit(
             X, y,
             sample_weight=sample_weights,

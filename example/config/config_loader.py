@@ -8,16 +8,41 @@ Utility module for loading and accessing YAML configuration files.
 import yaml
 import os
 from typing import Dict, Any, Optional
+from datetime import datetime, timedelta
+
+def _process_date_value(date_value: str, years_back: int = 5) -> str:
+    """
+    날짜 값을 처리합니다. "auto"인 경우 동적으로 계산합니다.
+    
+    Args:
+        date_value: 날짜 값 ("auto" 또는 "YYYY-MM-DD" 형식)
+        years_back: "auto"일 때 사용할 년수 (start_date용)
+    
+    Returns:
+        처리된 날짜 문자열 ("YYYY-MM-DD" 형식)
+    """
+    if date_value.lower() == "auto":
+        # end_date인 경우 오늘 날짜 반환
+        if years_back == 0:
+            return datetime.now().strftime("%Y-%m-%d")
+        # start_date인 경우 years_back년 전 날짜 반환
+        else:
+            start_date = datetime.now() - timedelta(days=years_back * 365)
+            return start_date.strftime("%Y-%m-%d")
+    else:
+        # 이미 날짜 형식인 경우 그대로 반환
+        return date_value
+
 
 def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     """
-    YAML 설정 파일을 로드합니다.
+    YAML 설정 파일을 로드하고 날짜 값을 처리합니다.
     
     Args:
         config_path: 설정 파일 경로 (None이면 기본 경로 사용)
     
     Returns:
-        설정 딕셔너리
+        설정 딕셔너리 (날짜 값이 처리됨)
     """
     if config_path is None:
         # 기본 경로: example/config/sample_config.yaml
@@ -29,6 +54,25 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
+    
+    # 날짜 값 처리 (data 섹션)
+    if 'data' in config:
+        data_config = config['data']
+        years_back = data_config.get('years_back', 5)
+        
+        # start_date 처리
+        if 'start_date' in data_config:
+            data_config['start_date'] = _process_date_value(
+                data_config['start_date'], 
+                years_back=years_back
+            )
+        
+        # end_date 처리 (years_back=0으로 전달하여 오늘 날짜 반환)
+        if 'end_date' in data_config:
+            data_config['end_date'] = _process_date_value(
+                data_config['end_date'], 
+                years_back=0
+            )
     
     return config
 

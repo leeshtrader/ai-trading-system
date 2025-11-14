@@ -1,146 +1,486 @@
+# ============================================================================
 # 샘플 프로젝트 설정 파일
+# ============================================================================
 # 주의: 본 파일은 샘플/데모 목적입니다
+# 실제 투자 결정에 사용하지 마세요.
 
-# 데이터 설정
+# ============================================================================
+# 1. 데이터 설정
+# ============================================================================
 data:
-  symbol: "NVDA"  # NVIDIA 주식 (기본값)
-  start_date: "2019-01-01"
-  end_date: "2024-12-31"
-  data_source: "yahoo"  # yfinance 사용
-  output_dir: "data"
-  output_file: "nvda_data.csv"  # {symbol.lower()}_data.csv 형식
-  min_data_days: 730  # 최소 데이터 기간 (2년)
+  symbol: "NVDA"  # 거래할 주식 심볼 (NVIDIA)
+  start_date: "auto"  # 시작일: "auto"면 오늘로부터 years_back년 전, 또는 "YYYY-MM-DD" 형식
+  end_date: "auto"  # 종료일: "auto"면 오늘 날짜, 또는 "YYYY-MM-DD" 형식
+  years_back: 5  # start_date="auto"일 때 사용할 년수
+  data_source: "yahoo"  # 데이터 소스 (yfinance 사용)
+  output_dir: "data"  # 데이터 저장 디렉토리
+  output_file: "nvda_data.csv"  # 저장 파일명 (symbol.lower()_data.csv 형식)
+  min_data_days: 730  # 최소 데이터 기간 (2년, 통계적 신뢰도 확보)
 
-# 모델 설정
+# ============================================================================
+# 2. 모델 설정
+# ============================================================================
 models:
+  # --------------------------------------------------------------------------
+  # 2.1 XGBoost: 방향 예측 모델 (BUY/SELL/HOLD 분류)
+  # --------------------------------------------------------------------------
+  # 이론적 근거:
+  # - Gradient Boosting: 약한 학습기들을 순차적으로 결합하여 강한 학습기 생성
+  # - 트리 기반 모델: 비선형 관계와 피처 상호작용을 잘 포착
+  # - 정규화: 과적합 방지를 위해 L1/L2 정규화, 서브샘플링 사용
   xgboost:
-    n_estimators: 100
-    max_depth: 6
-    learning_rate: 0.05
-    min_child_weight: 1
-    gamma: 0.1
-    reg_alpha: 0.1
-    reg_lambda: 1.0
-    subsample: 0.8
-    colsample_bytree: 0.8
-    num_class: 3  # BUY, SELL, HOLD
-    random_state: 42
-    eval_metric: "mlogloss"
-  
+    # === 모델 복잡도 ===
+    n_estimators: 300  # 부스팅 라운드 수 (더 많은 학습 → 더 정확하지만 과적합 위험)
+    max_depth: 4  # 트리 최대 깊이 (과적합 방지: 5 → 4로 감소)
+    learning_rate: 0.01  # 학습률 (낮을수록 세밀한 학습, 0.03 → 0.01로 감소)
+    
+    # === 정규화 파라미터 (과적합 방지) ===
+    min_child_weight: 4  # 리프 노드 최소 샘플 수 (과적합 방지 강화: 3 → 4)
+    gamma: 0.3  # 트리 분할 최소 손실 감소 (0.2 → 0.3, 더 보수적 분할)
+    reg_alpha: 0.2  # L1 정규화 (0.15 → 0.2, 희소성 증가)
+    reg_lambda: 2.0  # L2 정규화 (1.5 → 2.0, 가중치 제한 강화)
+    subsample: 0.75  # 행 샘플링 비율 (0.8 → 0.75, 다양성 증가)
+    colsample_bytree: 0.75  # 열 샘플링 비율 (0.8 → 0.75, 다양성 증가)
+    
+    # === 학습 제어 ===
+    early_stopping_rounds: 20  # 조기 종료: 검증 손실이 20라운드 동안 개선되지 않으면 종료
+    num_class: 3  # 분류 클래스 수 (0=HOLD, 1=BUY, 2=SELL)
+    random_state: 42  # 재현성을 위한 시드
+    eval_metric: "mlogloss"  # 평가 지표 (다중 분류 로그 손실)
+    scale_pos_weight: 1.0  # 클래스 불균형 가중치 (이진 분류용, 다중 분류에서는 sample_weight 사용)
+
+  # --------------------------------------------------------------------------
+  # 2.2 LSTM: 가격 목표 예측 모델 (목표가/손절가 예측)
+  # --------------------------------------------------------------------------
+  # 이론적 근거:
+  # - LSTM: 시계열 데이터의 장기 의존성 학습 (순환 신경망)
+  # - 시퀀스 학습: 과거 20일 데이터를 보고 미래 가격 목표 예측
+  # - Dropout: 과적합 방지 (20% 뉴런 무작위 비활성화)
   lstm:
-    sequence_length: 20
-    lstm_units: 32
-    num_layers: 2
-    dropout_rate: 0.2
-    epochs: 30
-    learning_rate: 0.001
-    optimizer: "Adam"
-    input_size: 5  # close, volume, rsi, macd, bb_position
-    fc_hidden_size: 16
-    output_size: 5  # target_price, stop_loss, time_horizon, confidence, volatility
-    device: "cpu"  # cpu or cuda
-    # 가격 예측 기본값
-    default_target_ratio: 1.02  # 현재가격 * 1.02
-    default_stop_loss_ratio: 0.98  # 현재가격 * 0.98
-    unrealistic_range_min: 0.5
-    unrealistic_range_max: 2.0
-  
+    # === 시퀀스 설정 ===
+    sequence_length: 20  # 입력 시퀀스 길이 (과거 20일 데이터 사용)
+    input_size: 5  # 입력 피처 수: [close, volume, rsi, macd, bb_position]
+    
+    # === 모델 구조 ===
+    lstm_units: 32  # LSTM 유닛 수 (은닉층 크기)
+    num_layers: 2  # LSTM 레이어 수 (깊이)
+    fc_hidden_size: 16  # 완전연결층 은닉 크기
+    output_size: 5  # 출력 크기: [target_price, stop_loss, time_horizon, confidence, volatility]
+    dropout_rate: 0.2  # 드롭아웃 비율 (과적합 방지: 20% 뉴런 무작위 비활성화)
+    
+    # === 학습 설정 ===
+    epochs: 100  # 학습 에포크 수 (30 → 100으로 증가)
+    learning_rate: 0.001  # 학습률 (Adam 최적화)
+    optimizer: "Adam"  # 최적화 알고리즘 (적응적 학습률)
+    device: "cpu"  # 계산 장치 (cpu or cuda)
+    
+    # === 출력 검증 ===
+    unrealistic_range_min: 0.5  # 비현실적 목표가 최소값 (현재가의 50% 미만은 비현실적)
+    unrealistic_range_max: 2.0  # 비현실적 목표가 최대값 (현재가의 200% 초과는 비현실적)
+
+  # --------------------------------------------------------------------------
+  # 2.3 강화학습 (RL): 포지션 크기 결정 모델
+  # --------------------------------------------------------------------------
+  # 이론적 근거:
+  # - PPO (Proximal Policy Optimization): 안정적인 정책 경사법 알고리즘
+  # - 보상 함수: 수익률 기반 보상 + 리스크 페널티 + 기회비용 페널티
+  # - 액션 스페이스: 연속적이지만 10% 단위로 이산화 (0.0, 0.1, 0.2, ..., 1.0)
+  # 
+  # 보상 함수 파라미터 최적화:
+  # - run_sample.py 실행 시 자동으로 Sharpe Ratio 기반 최적화 수행 (auto_optimize_reward_params: true)
+  # - 또는 수동으로: python tools/optimize_reward_params.py --n_trials 20
+  # - 최적화된 파라미터는 자동으로 이 config 파일에 반영됨
   rl:
-    algorithm: "PPO"
-    learning_rate: 3e-4
-    total_timesteps: 100000
-    gamma: 0.99
-    n_steps: 256
-    batch_size: 128
-    n_epochs: 10
-    ent_coef: 0.05
-    vf_coef: 0.5
-    max_grad_norm: 0.5
-    clip_range: 0.2
-    initial_balance: 100000
-    position_size: 0.3  # 고정 포지션 크기
-    observation_space_size: 12
+    # === 알고리즘 설정 ===
+    # 지원 알고리즘: PPO, A2C, DQN, SAC, TD3, DDPG
+    # - PPO: 안정적인 on-policy 알고리즘 (권장, 기본값)
+    # - A2C: 빠른 on-policy 알고리즘 (PPO보다 빠르지만 덜 안정적)
+    # - SAC: 연속 액션 공간용 off-policy 알고리즘 (최고 성능 가능)
+    # - TD3: 연속 액션 공간용 off-policy 알고리즘 (SAC 대안)
+    # - DDPG: 연속 액션 공간용 off-policy 알고리즘 (구식, TD3보다 성능 낮음)
+    # - DQN: 이산 액션 공간용 (현재 환경은 연속 액션이므로 권장하지 않음)
+    algorithm: "SAC"  # 선택 가능: PPO, A2C, SAC, TD3, DDPG, DQN
+    
+    # === 공통 파라미터 (모든 알고리즘 공통) ===
+    learning_rate: 3e-4  # 학습률 (3e-4 → 1e-4, 더 세밀한 학습)
+    total_timesteps: 100000  # 총 학습 스텝 수
+    gamma: 0.99  # 할인 계수 (미래 보상의 현재 가치)
+    
+    # === On-policy 알고리즘 파라미터 (PPO, A2C) ===
+    n_steps: 256  # 정책 업데이트 전 수집할 스텝 수 (PPO, A2C)
+    batch_size: 128  # 배치 크기 (PPO)
+    n_epochs: 10  # 각 업데이트마다 에포크 수 (PPO만)
+    ent_coef: 0.1  # 엔트로피 계수 (탐험 강도, PPO, A2C, SAC)
+    vf_coef: 0.5  # 가치 함수 계수 (정책과 가치 함수의 균형, PPO, A2C)
+    max_grad_norm: 0.5  # 그래디언트 클리핑 (폭발 방지, PPO, A2C)
+    clip_range: 0.2  # PPO 클리핑 범위 (PPO만)
+    
+    # === A2C 전용 파라미터 ===
+    gae_lambda: 0.95  # GAE(Generalized Advantage Estimation) 람다 (A2C)
+    use_sde: false  # State Dependent Exploration 사용 여부 (A2C)
+    sde_sample_freq: -1  # SDE 샘플링 빈도 (use_sde가 true일 때만, A2C)
+    
+    # === Off-policy 알고리즘 파라미터 (SAC, TD3, DDPG, DQN) ===
+    buffer_size: 100000  # 리플레이 버퍼 크기 (SAC, TD3, DDPG, DQN)
+    learning_starts: 1000  # 학습 시작 전 수집할 스텝 수 (SAC, TD3, DDPG, DQN)
+    train_freq: 1  # 학습 빈도 (SAC, TD3, DDPG: 1, DQN: 4)
+    gradient_steps: 1  # 각 학습마다 그래디언트 업데이트 횟수 (SAC, TD3, DDPG, DQN)
+    tau: 0.005  # 타겟 네트워크 업데이트 계수 (SAC, TD3, DDPG: 0.005, DQN: 1.0)
+    
+    # === SAC 전용 파라미터 ===
+    sac_target_update_interval: 1  # 타겟 네트워크 업데이트 간격 (SAC)
+    # ent_coef는 위의 공통 파라미터 참조 (SAC는 'auto'도 가능)
+    
+    # === TD3 전용 파라미터 ===
+    policy_delay: 2  # 정책 업데이트 지연 (TD3)
+    target_policy_noise: 0.2  # 타겟 정책 노이즈 (TD3)
+    target_noise_clip: 0.5  # 타겟 노이즈 클리핑 (TD3)
+    
+    # === DQN 전용 파라미터 ===
+    dqn_train_freq: 4  # 학습 빈도 (DQN만, 다른 알고리즘은 train_freq 사용)
+    dqn_target_update_interval: 1000  # 타겟 네트워크 업데이트 간격 (DQN)
+    
+    # === 검증 및 조기 종료 ===
+    enable_early_stopping: true  # 조기 종료 활성화
+    early_stopping_patience: 10  # 10회 평가 동안 개선 없으면 종료
+    eval_freq: 5000  # 5000 timesteps마다 검증 평가
+    
+    # === 환경 설정 ===
+    initial_balance: 100000  # 초기 자본금
+    position_size: 0.3  # 고정 포지션 크기 (사용 안 함, RL이 동적으로 결정)
+    observation_space_size: 11  # 관측 공간 크기 (XGBoost/LSTM 정보 포함, 기술적 지표 제거)
+    price_normalization: 200  # 가격 정규화 기준 (보상 함수와 무관)
+    
+    # === 액션 스페이스 이산화 ===
+    min_meaningful_position_change: 0.05  # 액션 이산화 단위 (5% 단위: 0.0, 0.05, 0.1, ..., 1.0)
+    # 이론적 근거:
+    # 1. 거래 비용 고려: 
+    #    - 거래 수수료(0.1% × 2 = 0.2%)를 고려할 때, 5% 미만의 포지션 변화는 
+    #      수수료 대비 수익이 미미하여 비효율적
+    #    - 예: 1% 포지션 변화 시 순수익 = 1% - 0.2% = 0.8% (매우 작음)
+    #    - 5% 포지션 변화 시 순수익 = 5% - 0.2% = 4.8% (의미있는 변화)
+    # 2. 학습 안정성:
+    #    - 연속적 액션 공간은 학습이 불안정할 수 있음
+    #    - 이산화된 액션 공간(21개: 0.0, 0.05, ..., 1.0)은 학습을 더 안정적으로 만듦
+    #    - 너무 세밀한 단위(1%: 101개)는 학습 복잡도 증가, 너무 큰 단위(10%: 11개)는 정밀도 부족
+    # 3. 실용성:
+    #    - 실제 거래에서 5% 미만의 미세한 조절은 실행 비용 대비 효과가 낮음
+    #    - 5% 단위는 직관적이고 해석하기 쉬움 (예: "25% 포지션" = 5단계)
+    # 4. 최적 단위 선택:
+    #    - 1% (101개): 너무 세밀, 학습 복잡도 높음, 거래 비용 대비 비효율
+    #    - 2% (51개): 여전히 세밀, 거래 비용 고려 시 최소 단위로는 작음
+    #    - 5% (21개): 권장, 거래 비용 대비 효율적, 학습 안정성과 정밀도 균형
+    #    - 10% (11개): 너무 거칠어, 정밀도 부족, 수익 기회 제한
+    # 참고: 필요시 실험을 통해 최적값 조정 가능 (예: 변동성이 큰 시장에서는 10% 단위 고려)
+    
+    # ========================================================================
     # 보상 함수 파라미터
-    reward_scale: 200
-    opportunity_cost_penalty: 50
-    avoidance_bonus: 30
-    correct_direction_bonus: 100
-    wrong_direction_penalty: 50
-    action_bonus: 0.5
-    transaction_cost: 0.05
-    price_normalization: 200  # 가격 정규화 기준
+    # ========================================================================
+    # 이론적 근거:
+    # - 보상 함수는 RL Agent의 학습 방향을 결정하는 핵심 요소
+    # - 스케일 규칙: reward_scale(200)을 기준으로 상대적 비중 설정
+    # - 목표: 수익률 극대화 + 리스크 관리 + 기회비용 고려
+    
+    # === 기본 보상 (수익률 기반) ===
+    reward_scale: 128.5773  # 자동 최적화 가능 (Sharpe Ratio 기반)
+    # 계산식: reward = (price_change × position_size) × reward_scale
+    # 이론적 근거: 실제 수익률에 비례한 보상 (포지션 크기 고려)
+    # 최적화: run_sample.py 실행 시 자동 최적화 또는 tools/optimize_reward_params.py 수동 실행
+    
+    # === 리스크 관리 페널티 ===
+    position_risk_penalty_scale: 29.6746  # 자동 최적화됨 (Sharpe Ratio 기반)
+    # 계산식: penalty = position_size × volatility × position_risk_penalty_scale
+    # 이론적 근거: 큰 포지션일수록 변동성 리스크 증가 → 페널티 증가
+    # 스케일: reward_scale × 0.4 (100 → 80으로 완화, 수익 기회와 리스크 관리 균형)
+    
+    # === 기회비용 페널티 ===
+    opportunity_cost_penalty: 24.0344  # 자동 최적화됨 (Sharpe Ratio 기반)
+    # 계산식: penalty = price_change × opportunity_cost_penalty × position_multiplier
+    # 적용 조건: 포지션이 0이 되었을 때 (유지 또는 전체 청산) 가격이 상승하면 페널티
+    # position_multiplier: 포지션 유지(0→0)는 1.0, 전체 청산(1.0→0.0)은 1.0 (청산한 포지션 크기)
+    # 이론적 근거: 포지션을 포기하면 가격 상승 시 기회비용 발생
+    # 스케일: reward_scale × 0.25
+    
+    # === 손실 회피 보너스 ===
+    avoidance_bonus: 19.0766  # 자동 최적화됨 (Sharpe Ratio 기반)
+    # 계산식: bonus = price_change × avoidance_bonus × position_multiplier
+    # 적용 조건: 포지션이 0이 되었을 때 가격이 하락하면 보너스
+    # 이론적 근거: 손실 회피는 올바른 결정 (리스크 관리)
+    # 스케일: reward_scale × 0.25
+    
+    # === 방향성 보상/페널티 ===
+    correct_direction_bonus: 86.3884  # 자동 최적화됨 (Sharpe Ratio 기반)
+    # 계산식: bonus = price_change × correct_direction_bonus × position_change
+    # 적용 조건: 포지션 증가 시 가격 상승, 또는 포지션 감소 시 가격 하락
+    # 이론적 근거: 올바른 타이밍에 포지션 조절 → 보상
+    # 스케일: reward_scale × 0.5
+    
+    wrong_direction_penalty: 44.0295  # 자동 최적화됨 (Sharpe Ratio 기반)
+    # 계산식: penalty = price_change × wrong_direction_penalty × position_change
+    # 적용 조건: 포지션 증가 시 가격 하락, 또는 포지션 감소 시 가격 상승
+    # 이론적 근거: 잘못된 타이밍에 포지션 조절 → 페널티
+    # 스케일: reward_scale × 0.25
+    
+    # === 거래 비용 (Deprecated: 백테스트와 동일한 방식으로 변경됨) ===
+    # transaction_cost: 0.05  # 더 이상 사용하지 않음
+    # 참고: 이제 백테스트 설정의 transaction_cost_rate를 사용
+    # RL 환경: transaction_cost = abs(position_change) * balance * transaction_cost_rate
+    # 백테스트: transaction_cost = abs(position_change) * balance * transaction_cost_rate
+    # 두 환경이 동일한 방식으로 거래 비용을 계산하도록 개선됨
+    
+    # === 익실현/손실 확대 보상/페널티 ===
+    profit_taking_bonus_scale: 145.7301  # 자동 최적화됨 (Sharpe Ratio 기반)
+    # 계산식: bonus = unrealized_pnl_ratio × position_change × profit_taking_bonus_scale
+    # 적용 조건: 수익이 있을 때 포지션을 줄이면 보상 (익실현)
+    # 이론적 근거: 수익 실현은 올바른 결정 (리스크 관리)
+    # 스케일: reward_scale × 1.0
+    
+    loss_expansion_penalty_scale: 94.5983  # 자동 최적화됨 (Sharpe Ratio 기반)
+    # 계산식: base_penalty = abs(unrealized_pnl_ratio) × position_change × loss_expansion_penalty_scale
+    # 적용 조건: 손실이 있을 때 포지션을 늘리면 기본 페널티 (손실 확대 방지)
+    # 이론적 근거: 무작정 분할매수 방지, 단 강한 상승 예상 시 페널티 감소/보너스 부여
+    # 개선 사항:
+    #   - 평균 진입가 업데이트: 분할매수 시 평균 진입가를 정확히 계산하여 평가손익 반영
+    #   - 신호 기반 조정: XGBoost BUY 확률 > 0.6 또는 LSTM 목표가 > 현재가 × 1.03일 때
+    #     → 매우 강한 신호(combined_strength > 0.7): 보너스 부여 (페널티의 30%를 보너스로)
+    #     → 강한 신호(보통): 페널티 감소 (최대 50% 감소)
+    #     → 약한 신호: 기존 페널티 적용 (무작정 분할매수 방지)
+    # 스케일: reward_scale × 0.6 (150 → 120으로 완화, 분할매수 기회 확대)
+    
+    # === LSTM 기반 포지션 조절 보상/페널티 ===
+    lstm_position_bonus: 8.4294  # 자동 최적화됨 (Sharpe Ratio 기반)
+    lstm_position_bonus_scale: 6.8657  # 자동 최적화됨 (Sharpe Ratio 기반)
+    # 계산식: bonus = lstm_position_bonus × position_change × lstm_position_bonus_scale
+    # 최종 스케일: 5.0 × 10.0 = 50 = reward_scale × 0.25
+    # 적용 조건: LSTM 목표가/손절가 기반으로 올바른 포지션 조절 시 보상
+    # 이론적 근거: LSTM의 가격 예측을 활용한 포지션 조절 장려
+    
+    lstm_position_penalty_scale: 4.2147  # 자동 최적화됨 (Sharpe Ratio 기반)
+    # 계산식: penalty = lstm_position_bonus × position_change × lstm_position_penalty_scale
+    # 최종 스케일: 5.0 × 5.0 = 25 = reward_scale × 0.125
+    # 적용 조건: LSTM 목표가/손절가 기반으로 잘못된 포지션 조절 시 페널티
+    # 이론적 근거: LSTM 예측과 반대되는 포지션 조절 방지
+    
+    # === XGBoost 신호 일치 보너스 ===
+    signal_match_bonus: 11.7526  # 자동 최적화됨 (Sharpe Ratio 기반)
+    # 계산식: bonus = signal_match_bonus × prob × position_change
+    # 적용 조건: RL의 포지션 조절이 XGBoost 신호와 일치하면 보상
+    # 이론적 근거: XGBoost의 방향 예측을 활용한 포지션 조절 장려
+    # 스케일: reward_scale × 0.05 (작은 보조 보너스)
+    
+    # === 포지션 다양성 보너스 ===
+    position_diversity_bonus: 2.3766  # 자동 최적화됨 (Sharpe Ratio 기반)
+    # 계산식: 
+    #   - 극단적 포지션(0.0, 1.0): penalty = position_diversity_bonus × 0.5
+    #   - 중간 포지션(0.3~0.7): bonus = position_diversity_bonus
+    # 이론적 근거: 극단적 포지션 선택 방지, 다이나믹한 포지션 조절 유도
+    # 스케일: reward_scale × 0.015 (5.0 → 3.0으로 완화, 극단적 포지션 억제 완화하여 수익 기회 확대)
 
-# 학습/테스트 설정
+# ============================================================================
+# 3. 학습/테스트 설정
+# ============================================================================
 training:
-  train_test_split: 0.8
-  validation_split: 0.8  # 학습 데이터의 80%를 다시 학습용으로 사용
-  enable_gpu: false
-  verbose: true
+  train_test_split: 0.8  # 학습/테스트 데이터 분할 비율 (80% 학습, 20% 테스트)
+  validation_split: 0.8  # 학습 데이터 내 검증 분할 비율 (학습 데이터의 80% 학습, 20% 검증)
+  enable_gpu: true  # GPU 사용 여부
+  # 적용 범위:
+  #   - LSTM: device 설정을 'cuda' 또는 'cpu'로 자동 설정
+  #   - XGBoost: tree_method를 'gpu_hist' 또는 'hist'로 자동 설정
+  #   - RL (stable-baselines3): PyTorch의 device 설정을 따름 (LSTM과 동일)
+  # 주의: GPU가 있어도 enable_gpu: false이면 CPU 사용, GPU가 없으면 자동으로 CPU 사용
+  verbose: true  # 상세 로그 출력
+  save_models: true  # 학습 후 모델 저장 여부
+  models_dir: "models"  # 모델 저장 디렉토리 (example/models/)
+  
+  # === 보상 함수 파라미터 자동 최적화 ===
+  auto_optimize_reward_params: False  # RL 학습 전 자동으로 보상 함수 파라미터 최적화 (Sharpe Ratio 기반)
+  # 주의사항:
+  #   - auto_optimize_reward_params: true로 설정하면 각 실행마다 최적화를 수행하므로 시간이 오래 걸립니다.
+  #   - 최적화는 한 번만 수행하고 결과를 config에 저장한 후 false로 설정하는 것을 권장합니다.
+  #   - 최적화된 파라미터는 자동으로 이 config 파일에 반영됩니다.
+  #   - 수동 최적화: python tools/optimize_reward_params.py --n_trials 20
+  reward_optimization_trials: 10  # 자동 최적화 시 Optuna trial 수 (시간 절약을 위해 기본값 10, 수동 실행 시 20 권장)
 
-# 레이블 생성 설정
+# ============================================================================
+# 4. 레이블 생성 설정
+# ============================================================================
+# 이론적 근거:
+# - 레이블은 다음 날 가격 변화를 기준으로 생성 (미래 정보 사용)
+# - 분위수 기반 임계값: 상위 30% = BUY, 하위 30% = SELL, 중간 40% = HOLD
+# - 기술적 지표 결합: RSI, MACD 등과 결합하여 레이블 품질 향상
+# - 변동성 필터링: 노이즈 제거를 위해 최소 가격 변화 임계값 사용
 labeling:
-  buy_percentile: 70  # 상위 30% = BUY
-  sell_percentile: 30  # 하위 30% = SELL
-  default_target_ratio: 1.02  # 2% 상승 목표
-  default_stop_loss_ratio: 0.98  # 2% 손절
-  default_time_horizon: 5  # 5일
-  default_confidence: 0.7
+  # === 분위수 기반 임계값 ===
+  buy_percentile: 70  # 상위 30% = BUY (70 백분위수 이상)
+  sell_percentile: 30  # 하위 30% = SELL (30 백분위수 이하)
+  # 이론적 근거: 극단적 가격 변화만 신호로 간주 (노이즈 제거)
+  
+  # === Rolling Window 기반 분위수 계산 ===
+  percentile_window_size: 252  # 분위수 계산 윈도우 크기 (252일 = 1년)
+  # 이론적 근거: 시장 환경 변화에 적응하기 위해 최근 N일의 분위수만 사용
+  # - 고정된 분위수 대신 rolling window 사용으로 시간적 일관성 확보
+  # - 252일(1년)은 충분한 통계적 신뢰도와 시장 변화 적응의 균형
+  
+  # === 노이즈 필터링 ===
+  min_price_change_threshold: 0.008  # 최소 가격 변화 임계값 (0.8%)
+  # 이론적 근거: 작은 가격 변동은 노이즈일 가능성이 높음
+  
+  # === 변동성 필터링 배수 ===
+  buy_volatility_multiplier: 2.0  # BUY 신호용 변동성 배수
+  sell_volatility_multiplier: 3.0  # SELL 신호용 변동성 배수 (더 엄격)
+  # 이론적 근거: 
+  # - SELL 신호는 BUY보다 더 엄격하게 처리 (손실 방지 우선)
+  # - 변동성의 2배(BUY) / 3배(SELL) 이상 변화만 신호로 간주
+  # - 이는 통계적 이상치(outlier) 감지 원리와 유사
+  
+  # === 변동성 기반 목표가/손절가 계산 ===
+  volatility_multiplier: 2.0  # 변동성의 배수 (2시그마 규칙)
+  # 계산식: target_ratio = 1.0 + (volatility × volatility_multiplier)
+  # 이론적 근거: 변동성이 클수록 목표가/손절가 범위 확대
+  
+  volatility_window: 60  # 변동성 계산 기간 (60일)
+  # 이론적 근거:
+  #   - 20일: 단기 변동성 (노이즈에 민감, 잦은 거래 유발)
+  #   - 60일: 중기 변동성 (권장, 통계적 신뢰도와 반응성의 균형)
+  #   - 90일: 장기 변동성 (안정적이지만 반응이 느림)
+  
+  # === 트렌드 기반 목표가/손절가 조정 ===
+  use_trend_adjustment: true  # 트렌드 기반 조정 사용 여부
+  # 이론적 근거: 변동성만으로는 방향성을 고려하지 못함
+  # - 상승 트렌드: 목표가를 더 높게, 손절가를 덜 낮게 설정
+  # - 하락 트렌드: 목표가를 덜 높게, 손절가를 더 낮게 설정
+  # - 횡보: 기존 변동성 기반 계산 유지
+  
+  trend_ma_window: 20  # 트렌드 판단용 이동평균선 기간 (20일)
+  # 이론적 근거: 단기 트렌드 방향을 판단하기 위한 적절한 기간
+  
+  trend_strength_threshold: 0.005  # 트렌드 강도 임계값 (0.5%)
+  # 이론적 근거: 현재가와 이동평균선의 차이가 이 값 이상이면 트렌드로 간주
+  # - 상승 트렌드: 현재가 > MA × (1 + threshold)
+  # - 하락 트렌드: 현재가 < MA × (1 - threshold)
+  # - 횡보: 그 외
+  
+  trend_adjustment_factor: 0.3  # 트렌드 조정 계수 (0.0 ~ 1.0)
+  # 계산식:
+  #   - 상승 트렌드: target_ratio += (vol × volatility_multiplier × trend_adjustment_factor)
+  #                  stop_loss_ratio -= (vol × volatility_multiplier × trend_adjustment_factor × 0.5)
+  #   - 하락 트렌드: target_ratio -= (vol × volatility_multiplier × trend_adjustment_factor × 0.5)
+  #                  stop_loss_ratio += (vol × volatility_multiplier × trend_adjustment_factor)
+  # 이론적 근거: 트렌드 방향에 따라 목표가/손절가를 비대칭적으로 조정
+  # - 상승 트렌드: 수익 기회 확대 (목표가 상향), 손실 방어 강화 (손절가 상향)
+  # - 하락 트렌드: 손실 방어 강화 (손절가 하향), 수익 기회 보수적 (목표가 하향)
+  
+  # === 수수료 고려한 목표가/손절가 범위 ===
+  consider_transaction_cost: true  # 수수료 자동 고려
+  # 거래 수수료: 매수 0.1% + 매도 0.1% = 총 0.2% (backtest.transaction_cost_rate × 2)
+  # 최소 익절: 수수료(0.2%) + 최소 순수익(1.3%) = 1.5% 이상 권장
+  # 최소 손절: 수수료(0.2%) + 최소 손실 허용(1.3%) = 1.5% 이상 권장
+  # 참고: 1% 목표는 수수료(0.2%)를 빼면 실제 수익이 0.8%밖에 안 되어 비효율적
+  
+  min_target_ratio: 1.015  # 최소 익절 비율 (1.5%, 수수료 고려)
+  max_target_ratio: 1.15  # 최대 익절 비율 (15%, 분할 매도 고려하여 넓게 설정)
+  min_stop_loss_ratio: 0.85  # 최소 손절 비율 (15%, 분할 매수 고려하여 넓게 설정)
+  max_stop_loss_ratio: 0.985  # 최대 손절 비율 (1.5%, 수수료 고려)
+  
+  # === 거래 빈도 제한 ===
+  min_trade_interval_days: 3  # 최소 거래 간격 (일) - 같은 방향 거래는 최소 N일 후에만 가능
+  # 이론적 근거: 과도한 거래 방지 (거래 비용 절감)
+  
+  # === 기본값 ===
+  default_time_horizon: 15  # 기본 시간 범위 (15일, 분할 매수/매도 고려하여 여유 있게 설정)
+  default_confidence: 0.7  # 기본 신뢰도
 
-# 백테스트 설정
+# ============================================================================
+# 5. 백테스트 설정
+# ============================================================================
 backtest:
-  initial_balance: 100000
-  transaction_cost_rate: 0.001  # 0.1%
-  sequence_start_offset: 20  # LSTM 시퀀스 길이
+  initial_balance: 100000  # 초기 자본금
+  transaction_cost_rate: 0.001  # 거래 수수료율 (0.1%, 매수/매도 각각 적용)
+  sequence_start_offset: 20  # LSTM 시퀀스 길이 (시퀀스 시작 인덱스 오프셋)
 
-# 앙상블 설정
+# ============================================================================
+# 6. 앙상블 설정
+# ============================================================================
+# 이론적 근거:
+# - 역할 분담 앙상블: 각 모델이 고유한 역할 수행
+#   * XGBoost: 방향 예측 (BUY/SELL/HOLD 확률)
+#   * LSTM: 가격 목표 예측 (목표가/손절가)
+#   * RL Agent: 최종 포지션 크기 결정 (XGBoost/LSTM 정보를 observation으로 활용)
+# - 임계값 최적화: 학습 시 자동으로 최적 임계값 계산 및 적용
 ensemble:
-  buy_threshold: 0.35
-  sell_threshold: 0.35
-  strong_signal_threshold: 0.4
-  base_position_size_multiplier: 0.4
-  max_position_size: 0.4
-  rl_match_position_multiplier: 1.2
-  max_position_size_rl_match: 0.5
-  # 신뢰도 가중치
-  direction_weight: 0.3
-  price_weight: 0.4
-  rl_weight: 0.3
-  default_current_price: 150.0
+  buy_threshold: 0.400  # 자동 최적화됨
+  sell_threshold: 0.400  # 자동 최적화됨
+  strong_signal_threshold: 0.500  # 자동 최적화됨
+  # 참고: 포지션 크기는 RL Agent가 결정 (XGBoost 확률은 RL의 입력으로만 사용)
+  # RL이 XGBoost/LSTM의 실제 신뢰도를 observation으로 받아 학습하므로 가중치 불필요
+  
+  default_current_price: 150.0  # LSTM 예측 시 current_price가 없을 때 사용 (거의 사용되지 않음)
 
-# 피처 엔지니어링 설정
+# ============================================================================
+# 7. 피처 엔지니어링 설정
+# ============================================================================
+# 이론적 근거:
+# - 기술적 지표: 가격/거래량 데이터에서 파생된 지표
+# - 이동평균: 추세 파악 (단기/중기/장기)
+# - MACD: 모멘텀 지표 (이동평균 수렴/발산)
+# - RSI: 상대강도지수 (과매수/과매도 판단)
+# - Bollinger Bands: 변동성 지표 (가격 밴드)
 feature_engineering:
-  # 이동평균
-  ma_5: 5
-  ma_20: 20
-  ma_60: 60
-  # EMA
-  ema_12: 12
-  ema_26: 26
-  # MACD
-  macd_signal_window: 9
-  # RSI
-  rsi_window: 14
-  # Bollinger Bands
-  bb_window: 20
-  bb_std: 2
-  # Z-Score
-  z_score_window: 20
-  # 거래량
-  volume_ma_window: 20
-  # 변동성
-  volatility_window: 20
-  # LSTM 시퀀스
+  # === 이동평균 (Moving Average) ===
+  ma_5: 5  # 단기 이동평균 (5일)
+  ma_20: 20  # 중기 이동평균 (20일)
+  ma_60: 60  # 장기 이동평균 (60일)
+  # 이론적 근거: 추세 파악 및 노이즈 제거
+  
+  # === 지수 이동평균 (EMA) ===
+  ema_12: 12  # 단기 EMA (12일, MACD 계산용)
+  ema_26: 26  # 장기 EMA (26일, MACD 계산용)
+  # 이론적 근거: 최근 데이터에 더 높은 가중치 부여
+  
+  # === MACD (Moving Average Convergence Divergence) ===
+  macd_signal_window: 9  # MACD 신호선 윈도우 (9일)
+  # 계산식: MACD = EMA(12) - EMA(26), Signal = EMA(MACD, 9)
+  # 이론적 근거: 모멘텀 및 추세 전환 신호
+  
+  # === RSI (Relative Strength Index) ===
+  rsi_window: 14  # RSI 계산 윈도우 (14일, 표준값)
+  # 계산식: RSI = 100 - (100 / (1 + RS)), RS = 평균 상승 / 평균 하락
+  # 이론적 근거: 과매수(RSI > 70) / 과매도(RSI < 30) 판단
+  
+  # === Bollinger Bands ===
+  bb_window: 20  # 볼린저 밴드 윈도우 (20일)
+  bb_std: 2  # 표준편차 배수 (2시그마)
+  # 계산식: 중간선 = MA(20), 상단 = 중간선 + 2×std, 하단 = 중간선 - 2×std
+  # 이론적 근거: 변동성 및 가격 밴드 위치 파악
+  
+  # === Z-Score ===
+  z_score_window: 20  # Z-Score 계산 윈도우 (20일)
+  # 계산식: Z = (현재가 - 평균) / 표준편차
+  # 이론적 근거: 가격의 정규화된 위치 파악
+  
+  # === 거래량 지표 ===
+  volume_ma_window: 20  # 거래량 이동평균 윈도우 (20일)
+  # 이론적 근거: 거래량 추세 파악 (가격 변화의 신뢰도 판단)
+  
+  # === 변동성 지표 ===
+  volatility_window: 60  # 변동성 계산 기간 (60일, 통계적 신뢰도 높음)
+  # 이론적 근거: 20일은 너무 짧아 노이즈에 민감, 60일은 통계적 신뢰도와 반응성의 균형
+  
+  # === LSTM 시퀀스 피처 ===
   lstm_sequence_features: ["close", "volume", "rsi", "macd", "bb_position"]
-  # 상태 정보
-  default_initial_balance: 100000.0
-  default_initial_position: 0.0
-  default_volatility: 0.01
+  # 이론적 근거: 시계열 예측에 중요한 피처만 선택 (차원 축소)
+  
+  # === 기본값 ===
+  default_initial_balance: 100000.0  # 기본 초기 자본금
+  default_initial_position: 0.0  # 기본 초기 포지션
+  default_volatility: 0.01  # 기본 변동성 (1%)
 
-# 시각화 설정
+# ============================================================================
+# 8. 시각화 설정
+# ============================================================================
 visualization:
-  dpi: 150
-  portfolio_cover_dpi: 100
-  portfolio_cover_size: [4.8, 4.8]  # 인치
-  lstm_sample_size: 50
-  feature_importance_top_n: 15
-
+  dpi: 150  # 일반 차트 해상도 (dots per inch)
+  portfolio_cover_dpi: 100  # 포트폴리오 표지 차트 해상도
+  portfolio_cover_size: [4.8, 4.8]  # 포트폴리오 표지 크기 (인치)
+  lstm_sample_size: 50  # LSTM 예측 샘플 수 (시각화용)
+  feature_importance_top_n: 15  # 상위 N개 피처 중요도 표시

@@ -226,3 +226,16 @@ __marimo__/
 
 # CSV files
 *.csv
+
+# Machine Learning / AI Model files
+example/models/
+*.pkl
+*.pth
+*.h5
+*.hdf5
+*.pt
+*.ckpt
+*.pb
+*.onnx
+*.joblib
+*.model
